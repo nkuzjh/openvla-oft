@@ -1,0 +1,34 @@
+# OpenVLA-OFT CSGO Seen-10 localization runtime.
+# The CUDA 12.8 wheels are installed separately by scripts/setup_csgo_seen10.sh
+# so the rest of this file can resolve exclusively from ordinary PyPI.
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchaudio==2.7.1+cu128
+
+# Native OpenVLA / localization dependencies.
+accelerate>=0.25.0
+draccus==0.8.0
+diffusers==0.30.3
+einops
+huggingface_hub>=0.24.0
+json-numpy
+jsonlines
+matplotlib
+numpy
+peft==0.11.1
+Pillow
+protobuf
+requests
+rich
+safetensors
+sentencepiece==0.1.99
+timm==0.9.10
+tokenizers==0.19.1
+tqdm
+# Pinned source archive keeps the exact bidirectional fork without a full git
+# checkout during setup.
+transformers @ https://github.com/moojink/transformers-openvla-oft/archive/bc339d9ad707454c0c115970db43c260067c61ab.tar.gz
+wandb
+
+# Used by the native action head / image utilities; no RLDS or TensorFlow is
+# required by the manifest-driven CSGO localization path.

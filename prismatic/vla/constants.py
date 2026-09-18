@@ -4,6 +4,7 @@ Important constants for VLA training and evaluation.
 Attempts to automatically identify the correct constants to set based on the Python command used to launch
 training or evaluation. If it is unclear, defaults to using the LIBERO simulation benchmark constants.
 """
+import os
 import sys
 from enum import Enum
 
@@ -44,9 +45,25 @@ BRIDGE_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+# CSGO Benchmark v2 Seen-10 uses a single absolute five degree-of-freedom
+# action.  Keep this as an explicit opt-in platform so importing the native
+# OpenVLA code for LIBERO/ALOHA/Bridge retains its historical defaults.
+CSGO_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 1,
+    "ACTION_DIM": 5,
+    "PROPRIO_DIM": 0,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS,
+}
+
 
 # Function to detect robot platform from command line arguments
 def detect_robot_platform():
+    explicit_platform = os.environ.get("OPENVLA_ROBOT_PLATFORM", "").strip().upper()
+    if explicit_platform in {"CSGO", "CSGO_SEEN10"}:
+        return "CSGO"
+    if explicit_platform in {"LIBERO", "ALOHA", "BRIDGE"}:
+        return explicit_platform
+
     cmd_args = " ".join(sys.argv).lower()
 
     if "libero" in cmd_args:
@@ -55,6 +72,8 @@ def detect_robot_platform():
         return "ALOHA"
     elif "bridge" in cmd_args:
         return "BRIDGE"
+    elif "csgo" in cmd_args or "seen10" in cmd_args:
+        return "CSGO"
     else:
         # Default to LIBERO if unclear
         return "LIBERO"
@@ -70,6 +89,8 @@ elif ROBOT_PLATFORM == "ALOHA":
     constants = ALOHA_CONSTANTS
 elif ROBOT_PLATFORM == "BRIDGE":
     constants = BRIDGE_CONSTANTS
+elif ROBOT_PLATFORM == "CSGO":
+    constants = CSGO_CONSTANTS
 
 # Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]

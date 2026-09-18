@@ -106,6 +106,17 @@ class L1RegressionActionHead(nn.Module):
         action = self.model(rearranged_actions_hidden_states)
         return action
 
+    def forward(self, actions_hidden_states):
+        """Run the action head through the normal ``nn.Module`` interface.
+
+        Native finetuning historically called ``predict_action`` on the
+        unwrapped DDP module.  Exposing the same operation as ``forward`` lets
+        CSGO's integration call a DDP-wrapped head directly, so its reducer
+        observes and synchronizes the head gradients in multi-GPU training.
+        """
+
+        return self.predict_action(actions_hidden_states)
+
 
 class NoisePredictionModel(nn.Module):
     """

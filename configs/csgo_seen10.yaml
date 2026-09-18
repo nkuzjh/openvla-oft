@@ -1,0 +1,40 @@
+# Native OpenVLA-OFT CSGO Benchmark v2 Seen-10 localization.
+# Full recipe: batch 1, accumulation 32, 19,500 optimizer steps (12.48
+# presentations of the 50,000-row training split), with validation/checkpoint
+# events at steps 3,900, 7,800, 11,700, 15,600 and 19,500.
+model_path: checkpoints/openvla-7b
+data_root: /home/jiahao/task/UniLIP/data/csgo_benchmark_v2
+output_root: outputs/csgo_benchmark_v2_seen10
+smoke_output_root: outputs/csgo_benchmark_v2_seen10_smoke
+shared_eval_dir: /home/jiahao/task/csgo_benchmark_v2_eval_general
+unilip_python: /home/jiahao/miniconda3/envs/UniLIP/bin/python
+maps:
+  - cs_agency
+  - cs_italy
+  - de_ancient
+  - de_anubis
+  - de_dust2
+  - de_inferno
+  - de_mirage
+  - de_nuke
+  - de_overpass
+  - de_train
+
+use_lora: true
+lora_rank: 32
+lora_dropout: 0.0
+gradient_checkpointing: true
+
+batch_size: 1
+val_batch_size: 1
+inference_batch_size: 1
+grad_accumulation_steps: 32
+learning_rate: 0.0005
+num_steps_before_decay: 13000
+max_steps: 19500
+event_every: 3900
+num_workers: 0
+
+smoke_max_steps: 5
+smoke_samples_per_map: 10
+visual_samples_per_map: 10
