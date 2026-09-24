@@ -10,6 +10,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -26,6 +27,8 @@ from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 
 from .data import SEEN10_MAPS, CSGOSeen10Dataset
+from .action_normalization import ActionNormalization, fit_seen_train_stats
+from .sampling import GlobalUpdateSampler, event_steps
 from .model import (
     ModelBundle,
     collate_samples,
@@ -199,6 +202,9 @@ class RecordDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        if isinstance(index, tuple):
+            index, epoch = index
+            return dict(self.records[index], _augmentation_epoch=int(epoch))
         return self.records[index]
 
 
@@ -250,7 +256,7 @@ def _records_for_split(
             include_targets=include_targets,
             max_samples=samples_per_map if smoke else None,
         )
-        records.extend(dataset[index] for index in range(len(dataset)))
+        records.extend(dict(dataset[index], split=dataset.split) for index in range(len(dataset)))
     if not records:
         raise ValueError(f"No records selected for {split} maps={maps}")
     return RecordDataset(records)
@@ -265,12 +271,22 @@ def _loader(
     include_targets: bool,
     num_workers: int = 0,
     generator: torch.Generator | None = None,
+    training: bool = False,
+    config: Mapping[str, Any] | None = None,
+    augmentation_seed: int = 0,
 ) -> DataLoader:
+    config = config or {}
     return DataLoader(
         dataset,
         batch_size=int(batch_size),
         sampler=sampler,
-        collate_fn=lambda instances: collate_samples(instances, processor, include_targets=include_targets),
+        collate_fn=partial(
+            collate_samples, processor=processor, include_targets=include_targets,
+            training=training,
+            fpv_augmentation=_config_value(config, "fpv_augmentation", "none"),
+            radar_augmentation=_config_value(config, "radar_augmentation", "none"),
+            augmentation_seed=augmentation_seed,
+        ),
         num_workers=int(num_workers),
         pin_memory=torch.cuda.is_available(),
         persistent_workers=bool(num_workers),
@@ -305,6 +321,139 @@ def _trainable_parameters(bundle: ModelBundle) -> list[torch.nn.Parameter]:
     if not params:
         raise RuntimeError("No trainable parameters found; LoRA/action head setup failed")
     return params
+
+
+def _is_aligned(config: Mapping[str, Any]) -> bool:
+    return bool(_config_value(config, "recipe_id", None))
+
+
+def _aligned_recipe(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolved experimental contract, also compared verbatim on resume."""
+    defaults = {
+        "recipe_id": None, "freeze_vision": False, "freeze_vl_projector": False,
+        "lora_scope": "all_linear", "lora_alpha": None,
+        "action_normalization": "none", "normalization_stats_split": "seen_train",
+        "clip_training_targets": True, "clip_predictions": False,
+        "fpv_augmentation": "none", "radar_augmentation": "none",
+        "sampler_policy": "legacy", "effective_batch_size": None,
+        "learning_rate": 5e-4, "weight_decay": 0.01, "adam_betas": [0.9, 0.999],
+        "adam_eps": 1e-8, "lr_warmup_steps": 0, "scheduler_gamma": 0.1,
+        "num_steps_before_decay": 100000, "max_steps": 19500,
+        "event_every": 4000, "checkpoint_selection": "late",
+        "validation_selection_metric": "external_normalized_l1",
+        "action_dim": 5, "action_horizon": 1, "use_proprio": False,
+        "use_l1_regression": True,
+        "base_shard_sha256": None,
+    }
+    return {key: _config_value(config, key, value) for key, value in defaults.items()}
+
+
+def _validate_aligned_config(config: Mapping[str, Any]) -> None:
+    if not _is_aligned(config):
+        return
+    expected = {
+        "freeze_vision": True, "freeze_vl_projector": True,
+        "lora_scope": "official_all_linear_excluding_frozen_modules", "lora_alpha": 16,
+        "action_normalization": "bounds_q99", "normalization_stats_split": "seen_train",
+        "clip_training_targets": True, "clip_predictions": False,
+        "fpv_augmentation": "oft_photometric_only", "radar_augmentation": "oft_photometric_only",
+        "sampler_policy": "global_full_update_batches", "effective_batch_size": 128,
+        "learning_rate": 5e-4, "weight_decay": 0.01, "adam_betas": [0.9, 0.999],
+        "adam_eps": 1e-8, "lr_warmup_steps": 0, "scheduler_gamma": 0.1,
+        "num_steps_before_decay": 100000, "max_steps": 19500, "event_every": 4000,
+        "checkpoint_selection": "late", "validation_selection_metric": "external_normalized_l1",
+        "action_dim": 5, "action_horizon": 1, "use_proprio": False, "use_l1_regression": True,
+    }
+    recipe = _aligned_recipe(config)
+    errors = {key: (recipe[key], value) for key, value in expected.items() if recipe[key] != value}
+    for key, default, value in (("use_lora", True, True), ("lora_rank", 32, 32), ("lora_dropout", 0.0, 0.0)):
+        if _config_value(config, key, default) != value:
+            errors[key] = (_config_value(config, key, default), value)
+    if errors:
+        raise ValueError(f"Aligned recipe differs from the approved contract: {errors}")
+    if not Path(_model_path(config)).expanduser().is_dir():
+        raise ValueError("Aligned runs require the local original base checkpoint; no downloads")
+    expected_shards = recipe["base_shard_sha256"]
+    if not isinstance(expected_shards, dict) or not expected_shards:
+        raise ValueError("Aligned configuration must pin the original base shard SHA256 values")
+    actual = _base_weight_identity(str(Path(_model_path(config)).expanduser().resolve()))
+    actual_shards = {key: value for key, value in actual.items() if key.endswith(".safetensors")}
+    if actual_shards != expected_shards:
+        raise ValueError("Local base weights differ from the approved original OpenVLA checkpoint")
+
+
+@lru_cache(maxsize=4)
+def _base_weight_identity(model_path: str) -> dict[str, str]:
+    """Hash the local initialization once per process, not only its index."""
+    root = Path(model_path).expanduser().resolve()
+    paths = [root / "config.json", root / "model.safetensors.index.json", *sorted(root.glob("model*.safetensors"))]
+    if len(paths) <= 2 or any(not path.is_file() for path in paths):
+        raise ValueError(f"Expected a local sharded original base: {root}")
+    return {path.name: sha256_file(path) for path in paths}
+
+
+def _model_kwargs(config: Mapping[str, Any], normalization: ActionNormalization) -> dict[str, Any]:
+    return {
+        "use_lora": bool(_config_value(config, "use_lora", True)),
+        "lora_rank": int(_config_value(config, "lora_rank", 32)),
+        "lora_dropout": float(_config_value(config, "lora_dropout", 0.0)),
+        "gradient_checkpointing": bool(_config_value(config, "gradient_checkpointing", True)),
+        "freeze_vision": bool(_config_value(config, "freeze_vision", False)),
+        "freeze_vl_projector": bool(_config_value(config, "freeze_vl_projector", False)),
+        "lora_scope": _config_value(config, "lora_scope", "all_linear"),
+        "lora_alpha": _config_value(config, "lora_alpha", None),
+        "action_normalization": normalization,
+        "recipe_id": _config_value(config, "recipe_id", None),
+    }
+
+
+def _prepare_normalization(config: Mapping[str, Any], data_root: str, maps: Sequence[str],
+                           checkpoint_dir: Path | None = None, *, fitting: bool = False) -> ActionNormalization:
+    mode = _config_value(config, "action_normalization", "none")
+    if mode == "none":
+        return ActionNormalization()
+    if mode != "bounds_q99" or _config_value(config, "normalization_stats_split", "seen_train") != "seen_train":
+        raise ValueError("Only seen_train Q99 statistics are supported")
+    manifest_hash = _sha256_optional(Path(data_root) / "benchmark_manifest.json")
+    fitted = None
+    if fitting:
+        # Always fit all 50k training IDs, including for a bounded smoke run.
+        dataset = _records_for_split(data_root, "seen_train", SEEN10_MAPS, include_targets=True)
+        fitted = ActionNormalization(mode="bounds_q99", stats=fit_seen_train_stats(dataset.records, manifest_hash))
+    if checkpoint_dir is not None:
+        saved = ActionNormalization.load(checkpoint_dir / "action_normalization.json")
+        if saved.mode != mode or saved.stats["manifest_sha256"] != manifest_hash:
+            raise ValueError("Checkpoint normalization does not match requested mode/manifest")
+        if fitted is not None and saved.to_dict() != fitted.to_dict():
+            raise ValueError("Checkpoint Q99 statistics differ from complete seen_train statistics")
+        return saved
+    if fitted is None:
+        raise ValueError("Inference requires checkpoint Q99 statistics; never fit from evaluation data")
+    return fitted
+
+
+def parameter_audit(bundle: ModelBundle, optimizer: AdamW) -> dict[str, Any]:
+    named = [(f"vla.{name}", p) for name, p in bundle.vla.named_parameters()]
+    named += [(f"action_head.{name}", p) for name, p in bundle.action_head.named_parameters()]
+    names = {id(p): name for name, p in named}
+    selected = [p for group in optimizer.param_groups for p in group["params"]]
+    if len({id(p) for p in selected}) != len(selected):
+        raise ValueError("Duplicate optimizer parameters")
+    if {id(p) for p in selected} != {id(p) for _, p in named if p.requires_grad}:
+        raise ValueError("Optimizer membership differs from requires_grad")
+    return {
+        "total_parameters": sum(p.numel() for _, p in named),
+        "declared_trainable_parameters": sum(p.numel() for _, p in named if p.requires_grad),
+        "parameters": [{"name": name, "shape": list(p.shape), "numel": p.numel(),
+                        "requires_grad": p.requires_grad,
+                        "expected_l1_dependency": p.requires_grad and "lm_head" not in name}
+                       for name, p in named],
+        "optimizer_groups": [{"lr": g["lr"], "weight_decay": g["weight_decay"],
+                              "betas": list(g["betas"]), "eps": g["eps"],
+                              "numel": sum(p.numel() for p in g["params"]),
+                              "members": [names[id(p)] for p in g["params"]]}
+                             for g in optimizer.param_groups],
+    }
 
 
 def _checkpoint_path(run_dir: Path, step: int) -> Path:
@@ -472,6 +621,17 @@ def _provenance_for_run(
         "config": str(config.get("_config_path", "")),
         "constants_selector": "CSGO",
     }
+    if _is_aligned(config):
+        result.update({
+            "recipe": _aligned_recipe(config),
+            "base_weight_sha256": _base_weight_identity(bundle.model_path),
+            "action_normalization": bundle.action_normalization.to_dict(),
+            "source_files_sha256": {
+                str(path.relative_to(Path(__file__).resolve().parent.parent)): sha256_file(path)
+                for path in sorted(Path(__file__).resolve().parent.glob("*.py"))
+            },
+            "adapter": "official all-linear LoRA excluding frozen vision and VL projector",
+        })
     if checkpoint_dir is not None:
         result["checkpoint_dir"] = str(checkpoint_dir.resolve())
         result["checkpoint_fingerprint"] = _checkpoint_fingerprint(checkpoint_dir)
@@ -493,7 +653,7 @@ def _resume_identity(
     model_identity = str(requested_path.resolve()) if requested_path.is_dir() else requested_model
     manifest = Path(data_root) / "benchmark_manifest.json"
     report = Path(data_root) / "minimal_dataset_report.json"
-    return {
+    identity = {
         "model_request": model_identity,
         "data_root": str(Path(data_root).resolve()),
         "benchmark_manifest_sha256": _sha256_optional(manifest),
@@ -507,6 +667,10 @@ def _resume_identity(
         "lora_dropout": float(_config_value(config, "lora_dropout", 0.0)),
         "gradient_checkpointing": bool(_config_value(config, "gradient_checkpointing", True)),
     }
+    if _is_aligned(config):
+        identity["recipe"] = _aligned_recipe(config)
+        identity["base_weight_sha256"] = _base_weight_identity(model_identity)
+    return identity
 
 
 def _git_commit() -> str | None:
@@ -571,6 +735,7 @@ def evaluate(
     bundle.vla.eval()
     bundle.action_head.eval()
     total_loss = 0.0
+    total_internal_loss = 0.0
     total_count = 0
     local_predictions: list[dict[str, Any]] = []
     evaluation_start = time.time()
@@ -597,7 +762,8 @@ def evaluate(
         for batch in dataloader:
             _, metrics, predictions = native_run_forward_pass(bundle, batch, device=ctx.device)
             batch_count = int(batch["actions"].shape[0])
-            total_loss += float(metrics["loss_value"]) * batch_count
+            total_loss += float(metrics.get("external_loss_value", metrics["loss_value"])) * batch_count
+            total_internal_loss += float(metrics["loss_value"]) * batch_count
             total_count += batch_count
             if ctx.is_main:
                 processed = total_count
@@ -628,11 +794,14 @@ def evaluate(
                         }
                     )
     total_loss, total_count = _reduce_scalar(total_loss, total_count, ctx)
+    total_internal_loss, _ = _reduce_scalar(total_internal_loss, 0, ctx)
     bundle.vla.train()
     bundle.action_head.train()
     if total_count <= 0:
         raise ValueError("Validation selected no samples")
-    result: dict[str, Any] = {"loss": total_loss / total_count, "count": float(total_count)}
+    result: dict[str, Any] = {"loss": total_loss / total_count,
+                              "internal_loss": total_internal_loss / total_count,
+                              "count": float(total_count)}
     if collect_predictions:
         if ctx.world_size > 1:
             gathered: list[list[dict[str, Any]] | None] = [None for _ in range(ctx.world_size)]
@@ -682,6 +851,7 @@ def _render_localization_visuals(
 def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None = None, smoke: bool = False) -> Path:
     """Run native AdamW/MultiStepLR training with five validation/save events."""
 
+    _validate_aligned_config(config)
     ctx = init_distributed()
     _set_seed(seed, ctx.rank)
     maps = _selected_maps(config)
@@ -702,8 +872,7 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
     learning_rate = float(_config_value(config, "learning_rate", 5e-4))
     max_steps = int(_config_value(config, "max_steps", 10_000))
     event_every = int(_config_value(config, "event_every", max_steps // 5))
-    if max_steps <= 0 or max_steps % 5 != 0 or event_every != max_steps // 5 or event_every <= 0:
-        raise ValueError("max_steps must be positive and divisible by 5; event_every must equal max_steps//5")
+    event_steps(max_steps, event_every)
     if batch_size <= 0 or grad_accum <= 0:
         raise ValueError("batch_size and grad_accumulation_steps must be positive")
     if smoke:
@@ -714,6 +883,9 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         if max_steps % 5:
             max_steps += 5 - max_steps % 5
         event_every = max_steps // 5
+    scheduled_events = set(event_steps(max_steps, event_every))
+    if _is_aligned(config) and not smoke and batch_size * grad_accum * ctx.world_size != 128:
+        raise ValueError("Aligned batch_size * grad_accumulation_steps * world_size must equal 128")
 
     resume_identity = _resume_identity(
         config=config,
@@ -753,6 +925,8 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         saved_identity = saved_provenance.get("resume_identity")
         if not isinstance(saved_identity, Mapping):
             raise ValueError("Resume checkpoint has no resume_identity; refusing a different dataset/model recipe")
+        if ("recipe" in saved_identity) != ("recipe" in resume_identity):
+            raise ValueError("Cannot resume between legacy and aligned recipes")
         identity_mismatches = {
             key: (saved_identity.get(key), value)
             for key, value in resume_identity.items()
@@ -762,14 +936,12 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
             raise ValueError(f"Resume dataset/model identity differs from checkpoint: {identity_mismatches}")
 
     model_path = _model_path(config)
+    normalization = _prepare_normalization(config, data_root, maps, resume_dir, fitting=True)
     bundle = create_model(
         model_path,
         device=ctx.device,
-        use_lora=bool(_config_value(config, "use_lora", True)),
-        lora_rank=int(_config_value(config, "lora_rank", 32)),
-        lora_dropout=float(_config_value(config, "lora_dropout", 0.0)),
         checkpoint_dir=resume_dir,
-        gradient_checkpointing=bool(_config_value(config, "gradient_checkpointing", True)),
+        **_model_kwargs(config, normalization),
     )
     bundle = _wrap_ddp(bundle, ctx)
 
@@ -789,14 +961,17 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         smoke=smoke,
         samples_per_map=int(_config_value(config, "smoke_samples_per_map", 10)),
     )
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=ctx.world_size,
-        rank=ctx.rank,
-        shuffle=True,
-        seed=int(seed),
-        drop_last=False,
-    )
+    if _config_value(config, "sampler_policy", "legacy") == "global_full_update_batches":
+        train_sampler = GlobalUpdateSampler(
+            train_dataset, effective_batch_size=batch_size * grad_accum * ctx.world_size,
+            microbatch_size=batch_size, accumulation_steps=grad_accum,
+            rank=ctx.rank, world_size=ctx.world_size, seed=int(seed),
+        )
+    else:
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=ctx.world_size, rank=ctx.rank,
+            shuffle=True, seed=int(seed), drop_last=False,
+        )
     # Validation is a metric over the exact selected rows.  DistributedSampler
     # pads an uneven dataset and would count duplicated rows, so use a strict
     # rank slice here.
@@ -810,6 +985,7 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         include_targets=True,
         num_workers=num_workers,
         generator=_loader_generator(seed, 2 * ctx.rank),
+        training=True, config=config, augmentation_seed=seed,
     )
     val_loader = _loader(
         val_dataset,
@@ -827,9 +1003,13 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         )
 
     trainable_parameters = _trainable_parameters(bundle)
-    optimizer = AdamW(trainable_parameters, lr=learning_rate)
+    optimizer = AdamW(trainable_parameters, lr=learning_rate,
+                      weight_decay=float(_config_value(config, "weight_decay", 0.01)),
+                      betas=tuple(_config_value(config, "adam_betas", [0.9, 0.999])),
+                      eps=float(_config_value(config, "adam_eps", 1e-8)))
     decay_step = int(_config_value(config, "num_steps_before_decay", 100_000))
-    scheduler = MultiStepLR(optimizer, milestones=[decay_step], gamma=0.1)
+    scheduler = MultiStepLR(optimizer, milestones=[decay_step],
+                            gamma=float(_config_value(config, "scheduler_gamma", 0.1)))
     start_step = 0
     epoch = 0
     next_batch = 0
@@ -856,6 +1036,30 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
     provenance["training_settings"] = training_settings
     if ctx.is_main:
         _json_dump(run_dir / "run_provenance.json", provenance)
+        if _is_aligned(config):
+            _json_dump(run_dir / "parameter_audit.json", parameter_audit(bundle, optimizer))
+            normalization.save(run_dir / "action_normalization.json")
+            # Audit the complete fit population, never the sampler-truncated
+            # subset (a smoke loader itself can contain fewer than 50k rows).
+            audit_records = train_dataset.records if len(train_dataset) == 50000 else _records_for_split(
+                data_root, "seen_train", SEEN10_MAPS, include_targets=True).records
+            values = np.asarray([row["target_pose"] for row in audit_records], dtype=np.float64)
+            stats = normalization.stats
+            raw_targets = 2 * (values - np.asarray(stats["q01"])) / (
+                np.asarray(stats["q99"]) - np.asarray(stats["q01"]) + 1e-8) - 1
+            _json_dump(run_dir / "normalization_audit.json", {
+                "source_split": "seen_train", "sample_count": len(audit_records),
+                "stats_sha256": stats["stats_sha256"],
+                "quantile_method": "numpy.quantile(method=linear)",
+                "external_contract": "benchmark_normalized_5d_no_z_epsilon",
+                "lower_clip_fraction": (raw_targets < -1).mean(axis=0).tolist(),
+                "upper_clip_fraction": (raw_targets > 1).mean(axis=0).tolist(),
+            })
+            _json_dump(run_dir / "resolved_recipe.json", _aligned_recipe(config) | {
+                "seed": seed, "world_size": ctx.world_size, "microbatch": batch_size,
+                "accumulation": grad_accum, "effective_batch": batch_size * grad_accum * ctx.world_size,
+                "event_steps": sorted(scheduled_events), "planned_update_exposures": max_steps * batch_size * grad_accum * ctx.world_size,
+            })
         _json_dump(
             run_dir / "training_config.json",
             {key: value for key, value in config.items() if not key.startswith("_")}
@@ -880,7 +1084,11 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
     probe_parameter = trainable_parameters[0]
     while global_step < max_steps:
         train_sampler.set_epoch(epoch)
+        if isinstance(train_sampler, GlobalUpdateSampler) and ctx.is_main:
+            _jsonl_append(run_dir / "logs" / "sampler_epochs.jsonl", train_sampler.epoch_audit())
         progressed_any = False
+        update_loss_sum = 0.0
+        update_sample_count = 0
         epoch_start_batch = next_batch
         if epoch_start_batch >= len(train_loader):
             epoch += 1
@@ -896,6 +1104,9 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite training loss at step={global_step}: {loss.item()}")
             (loss / grad_accum).backward()
+            count = int(batch["actions"].shape[0])
+            update_loss_sum += float(metrics["loss_value"]) * count
+            update_sample_count += count
             local_micro = batch_index - epoch_start_batch
             should_step = (local_micro + 1) % grad_accum == 0
             if not should_step:
@@ -911,6 +1122,9 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            loss_sum, loss_count = _reduce_scalar(update_loss_sum, update_sample_count, ctx)
+            update_loss = loss_sum / loss_count
+            update_loss_sum, update_sample_count = 0.0, 0
             next_batch = batch_index + 1
             next_epoch = epoch
             if next_batch >= len(train_loader):
@@ -920,7 +1134,9 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
                     loss_log,
                     {
                         "step": int(global_step),
-                        "loss": float(metrics["loss_value"]),
+                        "loss": update_loss,
+                        "update_sample_count": int(loss_count),
+                        "cumulative_update_exposures": global_step * batch_size * grad_accum * ctx.world_size,
                         "lr": float(scheduler.get_last_lr()[0]),
                         "probe_grad_norm": probe_grad_norm,
                         "probe_parameter_delta": probe_delta,
@@ -930,12 +1146,12 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
                 if global_step <= 2 or global_step % 50 == 0:
                     print(
                         f"[train] optimizer_step={global_step}/{max_steps} "
-                        f"loss={metrics['loss_value']:.6f} grad_norm={probe_grad_norm:.6g} "
+                        f"loss={update_loss:.6f} grad_norm={probe_grad_norm:.6g} "
                         f"parameter_delta={probe_delta:.6g} elapsed={time.time() - start_time:.1f}s",
                         flush=True,
                     )
 
-            if global_step % event_every == 0:
+            if global_step in scheduled_events:
                 validation = evaluate(bundle, val_loader, ctx=ctx, collect_predictions=True)
                 if ctx.is_main:
                     print(
@@ -949,6 +1165,8 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
                         {
                             "step": int(global_step),
                             "val_loss": float(validation["loss"]),
+                            "internal_val_loss": float(validation["internal_loss"]),
+                            "selection_metric": "external_normalized_l1",
                             "count": int(validation["count"]),
                         },
                     )
@@ -1114,7 +1332,10 @@ def inference(
 ) -> Path:
     """Generate normalized localization JSONL, resuming only missing sample IDs."""
 
+    _validate_aligned_config(config)
     ctx = init_distributed()
+    if _is_aligned(config) and (ctx.world_size != 1 or int(_config_value(config, "inference_batch_size", 1)) != 1):
+        raise ValueError("Aligned inference is fixed to one process and batch size one")
     _set_seed(seed, ctx.rank)
     maps = _selected_maps(config)
     if not smoke and maps != SEEN10_MAPS:
@@ -1125,15 +1346,20 @@ def inference(
     output_dir = run_dir / "localization"
     prediction_path = output_dir / "predictions.jsonl"
     manifest_path = output_dir / "inference_manifest.json"
-    checkpoint_dir = _find_resume_checkpoint(checkpoint or str(run_dir), prefer="best")
+    checkpoint_dir = _find_resume_checkpoint(
+        checkpoint or str(run_dir), prefer=_config_value(config, "checkpoint_selection", "best"))
+    normalization = _prepare_normalization(config, data_root, maps, checkpoint_dir, fitting=False)
+    if _is_aligned(config):
+        saved_state = _load_training_state(checkpoint_dir, device=torch.device("cpu"))
+        saved_identity = saved_state.get("provenance", {}).get("resume_identity", {})
+        requested_identity = _resume_identity(config=config, data_root=data_root, seed=seed, maps=maps, smoke=smoke)
+        if saved_identity != requested_identity:
+            raise ValueError("Inference checkpoint does not match aligned recipe, base, seed or dataset")
     bundle = create_model(
         _model_path(config),
         device=ctx.device,
-        use_lora=bool(_config_value(config, "use_lora", True)),
-        lora_rank=int(_config_value(config, "lora_rank", 32)),
-        lora_dropout=float(_config_value(config, "lora_dropout", 0.0)),
         checkpoint_dir=checkpoint_dir,
-        gradient_checkpointing=bool(_config_value(config, "gradient_checkpointing", True)),
+        **_model_kwargs(config, normalization),
     )
     bundle = _wrap_ddp(bundle, ctx)
     dataset = _records_for_split(
@@ -1159,6 +1385,10 @@ def inference(
             "sample_count": len(dataset),
             "smoke_only": bool(smoke),
             "official_output_written": not smoke,
+            "inference_batch_size": int(_config_value(config, "inference_batch_size", 1)),
+            "inference_world_size": ctx.world_size,
+            "decoding": "single_forward_continuous_l1",
+            "prediction_clip": False,
         }
     )
     expected_ids = {str(record["sample_id"]) for record in dataset.records}

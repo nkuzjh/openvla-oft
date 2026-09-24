@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -32,9 +33,11 @@ os.environ.setdefault("OPENVLA_ROBOT_PLATFORM", "CSGO")
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
+from peft.tuners.tuners_utils import _maybe_include_all_linear_layers
 from PIL import Image
 from torch import nn
 from transformers import AutoConfig, AutoModelForVision2Seq, AutoTokenizer
+from transformers.pytorch_utils import Conv1D
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
@@ -49,6 +52,9 @@ from prismatic.vla.constants import (
     NUM_ACTIONS_CHUNK,
     STOP_INDEX,
 )
+
+from .action_normalization import ActionNormalization
+from .augmentations import augment_image
 
 if (NUM_ACTIONS_CHUNK, ACTION_DIM) != (1, 5):
     raise RuntimeError(
@@ -195,6 +201,8 @@ class ModelBundle:
     model_path: str
     checkpoint_dir: str | None = None
     base_vla: nn.Module | None = None
+    action_normalization: ActionNormalization | None = None
+    model_recipe: dict[str, Any] | None = None
 
     @property
     def llm_dim(self) -> int:
@@ -224,6 +232,81 @@ def _enable_native_gradient_checkpointing(vla: nn.Module) -> None:
         base.enable_input_require_grads()
     if hasattr(language_model, "config"):
         language_model.config.use_cache = False
+
+
+def _aligned_linear_targets(model: nn.Module, config: LoraConfig) -> str:
+    """Resolve PEFT's *installed-version* all-linear rule, then omit frozen paths.
+
+    PEFT 0.11.1 first collects leaf names and then matches every path ending in
+    those names.  In particular its nested ``language_model.lm_head`` remains
+    selected.  Resolve that rule against each full path before filtering so a
+    short name shared with vision/projector cannot accidentally re-enable it.
+    """
+
+    resolved = _maybe_include_all_linear_layers(config, model)
+    short_names = set(resolved.target_modules)
+    paths = [
+        name for name, module in model.named_modules()
+        if isinstance(module, (nn.Linear, Conv1D))
+        and name.rsplit(".", 1)[-1] in short_names
+        and name not in {"vision_backbone", "projector"}
+        and not name.startswith(("vision_backbone.", "projector."))
+    ]
+    if not paths or not all(name.startswith("language_model.") for name in paths):
+        raise RuntimeError("Aligned all-linear selection must contain only LLM linear layers")
+    if not any(name == "language_model.lm_head" for name in paths):
+        raise RuntimeError("Installed PEFT all-linear selection did not include the nested lm_head")
+    return "(?:" + "|".join(re.escape(name) for name in sorted(paths)) + ")"
+
+
+def _normalization_digest(normalization: ActionNormalization | None) -> str | None:
+    if normalization is None or normalization.mode == "none":
+        return None
+    payload = json.dumps(normalization.to_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _read_checkpoint_recipe(checkpoint_dir: Path) -> dict[str, Any] | None:
+    path = checkpoint_dir / "model_recipe.json"
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid model recipe in {path}")
+    return value
+
+
+def _validate_checkpoint_recipe(
+    checkpoint_dir: Path,
+    expected: dict[str, Any],
+    normalization: ActionNormalization | None,
+) -> None:
+    saved = _read_checkpoint_recipe(checkpoint_dir)
+    is_aligned = expected["recipe_id"] != "legacy"
+    if saved is None:
+        if is_aligned:
+            raise FileNotFoundError(f"Aligned checkpoint lacks {checkpoint_dir / 'model_recipe.json'}")
+        return  # Original checkpoints predate recipe metadata.
+    for key, value in expected.items():
+        if saved.get(key) != value:
+            raise ValueError(f"Checkpoint recipe mismatch for {key}: saved={saved.get(key)!r}, requested={value!r}")
+    stats_file = checkpoint_dir / "action_normalization.json"
+    if is_aligned and not stats_file.is_file():
+        raise FileNotFoundError(f"Aligned checkpoint lacks {stats_file}")
+    if stats_file.is_file():
+        saved_norm = ActionNormalization.load(stats_file)
+        if _normalization_digest(saved_norm) != _normalization_digest(normalization):
+            raise ValueError("Checkpoint action normalization differs from requested training/evaluation stats")
+
+
+def _keep_frozen_modules_in_eval(bundle: ModelBundle) -> None:
+    recipe = bundle.model_recipe or {}
+    base = bundle.base_vla or unwrap_module(bundle.vla)
+    if recipe.get("freeze_vision"):
+        base.vision_backbone.eval()
+    if recipe.get("freeze_vl_projector"):
+        base.projector.eval()
 
 
 def _assert_oft_bidirectional(vla: nn.Module) -> None:
@@ -334,10 +417,44 @@ def create_model(
     use_lora: bool = True,
     lora_rank: int = 32,
     lora_dropout: float = 0.0,
+    lora_alpha: int | None = None,
+    freeze_vision: bool = False,
+    freeze_vl_projector: bool = False,
+    lora_scope: str = "all_linear",
+    action_normalization: ActionNormalization | None = None,
+    recipe_id: str | None = None,
     checkpoint_dir: str | os.PathLike[str] | None = None,
     gradient_checkpointing: bool = True,
 ) -> ModelBundle:
     """Create the pretrained model, CSGO two-image input path and action head."""
+
+    recipe_id = recipe_id or "legacy"
+    if lora_scope not in {"all_linear", "official_all_linear_excluding_frozen_modules"}:
+        raise ValueError(f"Unknown LoRA scope: {lora_scope}")
+    if lora_scope == "official_all_linear_excluding_frozen_modules":
+        if not (freeze_vision and freeze_vl_projector and use_lora):
+            raise ValueError("Aligned LoRA scope requires frozen vision/projector and LoRA enabled")
+        if action_normalization is None or action_normalization.mode != "bounds_q99":
+            raise ValueError("Aligned LoRA scope requires fitted bounds_q99 action normalization")
+        if recipe_id == "legacy":
+            raise ValueError("Aligned LoRA scope requires an explicit non-legacy recipe_id")
+    elif recipe_id != "legacy":
+        raise ValueError("Non-legacy recipe requires aligned LoRA scope")
+    recipe = {
+        "recipe_id": recipe_id,
+        "lora_scope": lora_scope,
+        "freeze_vision": bool(freeze_vision),
+        "freeze_vl_projector": bool(freeze_vl_projector),
+        "use_lora": bool(use_lora),
+        "lora_rank": int(lora_rank),
+        "lora_alpha": int(lora_alpha) if lora_alpha is not None else min(int(lora_rank), 16),
+        "lora_dropout": float(lora_dropout),
+        "action_dim": CSGO_ACTION_DIM,
+        "action_horizon": CSGO_HORIZON,
+        "normalization_sha256": _normalization_digest(action_normalization),
+    }
+    if checkpoint_dir is not None:
+        _validate_checkpoint_recipe(Path(checkpoint_dir), recipe, action_normalization)
 
     resolved_model_path = _resolve_model_path(model_path)
     processor = _load_local_processor(resolved_model_path)
@@ -349,15 +466,36 @@ def create_model(
     adapter_dir = _find_adapter_dir(Path(checkpoint_dir)) if checkpoint_dir is not None else None
     if adapter_dir is not None:
         vla = PeftModel.from_pretrained(vla, str(adapter_dir), is_trainable=True)
+        if lora_scope == "official_all_linear_excluding_frozen_modules":
+            frozen_adapter_names = [
+                name for name, _ in vla.named_parameters()
+                if "lora_" in name and (".vision_backbone." in name or ".projector." in name)
+            ]
+            if frozen_adapter_names:
+                raise ValueError("Aligned checkpoint adapter includes a frozen vision/projector layer")
     elif use_lora:
         lora_config = LoraConfig(
             r=int(lora_rank),
-            lora_alpha=min(int(lora_rank), 16),
+            lora_alpha=recipe["lora_alpha"],
             lora_dropout=float(lora_dropout),
             target_modules="all-linear",
             init_lora_weights="gaussian",
         )
+        if lora_scope == "official_all_linear_excluding_frozen_modules":
+            lora_config.target_modules = _aligned_linear_targets(base_vla, lora_config)
         vla = get_peft_model(vla, lora_config)
+
+    if freeze_vision:
+        base_vla.vision_backbone.requires_grad_(False)
+        base_vla.vision_backbone.eval()
+    if freeze_vl_projector:
+        base_vla.projector.requires_grad_(False)
+        base_vla.projector.eval()
+    if lora_scope == "official_all_linear_excluding_frozen_modules":
+        if any(p.requires_grad for p in base_vla.vision_backbone.parameters()):
+            raise RuntimeError("Aligned vision backbone has a trainable parameter")
+        if any(p.requires_grad for p in base_vla.projector.parameters()):
+            raise RuntimeError("Aligned VL projector has a trainable parameter")
 
     if gradient_checkpointing:
         _enable_native_gradient_checkpointing(vla)
@@ -372,6 +510,8 @@ def create_model(
         model_path=resolved_model_path,
         checkpoint_dir=str(Path(checkpoint_dir).resolve()) if checkpoint_dir is not None else None,
         base_vla=base_vla,
+        action_normalization=action_normalization,
+        model_recipe=recipe,
     )
 
 
@@ -389,7 +529,14 @@ def _prompt_ids(tokenizer: Any, instruction: str) -> list[int]:
 
 
 def _sample_instance(
-    sample: Mapping[str, Any], processor: PrismaticProcessor, *, include_target: bool
+    sample: Mapping[str, Any],
+    processor: PrismaticProcessor,
+    *,
+    include_target: bool,
+    training: bool = False,
+    fpv_augmentation: str = "none",
+    radar_augmentation: str = "none",
+    augmentation_seed: int = 0,
 ) -> dict[str, Any]:
     """Load one dataset metadata record into the native model-facing format."""
 
@@ -397,10 +544,24 @@ def _sample_instance(
     radar_path = sample.get("map_path", sample.get("radar_path"))
     if fpv_path is None or radar_path is None:
         raise KeyError("Seen-10 sample needs fpv_path/image_path and map_path/radar_path")
+    epoch = int(sample.get("_augmentation_epoch", 0))
+    sample_id = str(sample["sample_id"])
     with Image.open(fpv_path) as fpv_image:
-        fpv = processor.image_processor.apply_transform(fpv_image.convert("RGB"))
+        fpv_rgb = fpv_image.convert("RGB")
+        if training:
+            fpv_rgb = augment_image(
+                fpv_rgb, policy=fpv_augmentation, seed=int(augmentation_seed),
+                epoch=epoch, sample_id=sample_id, view="fpv",
+            )
+        fpv = processor.image_processor.apply_transform(fpv_rgb)
     with Image.open(radar_path) as radar_image:
-        radar = processor.image_processor.apply_transform(radar_image.convert("RGB"))
+        radar_rgb = radar_image.convert("RGB")
+        if training:
+            radar_rgb = augment_image(
+                radar_rgb, policy=radar_augmentation, seed=int(augmentation_seed),
+                epoch=epoch, sample_id=sample_id, view="radar",
+            )
+        radar = processor.image_processor.apply_transform(radar_rgb)
     if fpv.ndim != 3 or radar.ndim != 3:
         raise ValueError(f"Expected image tensors [C,H,W], got {tuple(fpv.shape)} and {tuple(radar.shape)}")
     if fpv.shape[0] != 6 or radar.shape[0] != 6:
@@ -447,12 +608,23 @@ def collate_samples(
     processor: PrismaticProcessor,
     *,
     include_targets: bool,
+    training: bool = False,
+    fpv_augmentation: str = "none",
+    radar_augmentation: str = "none",
+    augmentation_seed: int = 0,
 ) -> dict[str, Any]:
     """Collate manifest records into a native OpenVLA batch."""
 
     if not samples:
         raise ValueError("Cannot collate an empty sample list")
-    instances = [_sample_instance(sample, processor, include_target=include_targets) for sample in samples]
+    instances = [
+        _sample_instance(
+            sample, processor, include_target=include_targets, training=training,
+            fpv_augmentation=fpv_augmentation, radar_augmentation=radar_augmentation,
+            augmentation_seed=augmentation_seed,
+        )
+        for sample in samples
+    ]
     pad_id = int(processor.tokenizer.pad_token_id)
     if processor.tokenizer.padding_side != "right":
         raise ValueError("CSGO Seen-10 native collator requires right padding")
@@ -524,6 +696,7 @@ def forward_action(
     inputs = batch["input_ids"].to(device=device)
     attention_mask = batch["attention_mask"].to(device=device)
     pixels = batch["pixel_values"].to(device=device, dtype=torch.bfloat16)
+    _keep_frozen_modules_in_eval(bundle)
     with _autocast(device):
         output = bundle.vla(
             input_ids=inputs,
@@ -545,16 +718,33 @@ def forward_action(
         head_dtype = head_parameters[0].dtype if head_parameters else action_hidden.dtype
         normalized_actions = bundle.action_head(action_hidden.to(dtype=head_dtype))
         normalized_actions = normalized_actions.reshape(-1, CSGO_HORIZON, CSGO_ACTION_DIM)
+        # The head predicts the internal OFT space.  All public predictions
+        # retain the Benchmark's original normalized 5D pose contract.
+        action_normalization = bundle.action_normalization
+        if action_normalization is not None and action_normalization.mode != "none":
+            external_actions = action_normalization.inverse(normalized_actions.float())
+        else:
+            external_actions = normalized_actions
 
         if "actions" in batch:
-            targets = batch["actions"].to(device=device, dtype=normalized_actions.dtype)
-            loss = F.l1_loss(targets, normalized_actions)
-            current_loss = F.l1_loss(targets[:, 0], normalized_actions[:, 0])
+            external_targets = batch["actions"].to(device=device, dtype=torch.float32)
+            if action_normalization is not None and action_normalization.mode != "none":
+                targets = action_normalization.normalize(external_targets)
+                loss = F.l1_loss(targets, normalized_actions.float())
+                current_loss = F.l1_loss(targets[:, 0], normalized_actions[:, 0].float())
+                external_loss = F.l1_loss(external_targets, external_actions.float())
+            else:
+                # Preserve the legacy loss dtype and arithmetic exactly.
+                targets = external_targets.to(dtype=normalized_actions.dtype)
+                loss = F.l1_loss(targets, normalized_actions)
+                current_loss = F.l1_loss(targets[:, 0], normalized_actions[:, 0])
+                external_loss = loss
             # Horizon one has no future action.  ``F.l1_loss`` on two empty
             # tensors returns NaN, so expose a finite zero metric explicitly.
             next_loss = torch.zeros((), device=device, dtype=loss.dtype)
             metrics = {
                 "loss_value": float(loss.detach().float().item()),
+                "external_loss_value": float(external_loss.detach().float().item()),
                 "curr_action_l1_loss": float(current_loss.detach().float().item()),
                 "next_actions_l1_loss": float(next_loss.item()),
                 "action_count": float(targets.numel()),
@@ -565,13 +755,14 @@ def forward_action(
             loss = torch.zeros((), device=device, dtype=normalized_actions.dtype)
             metrics = {
                 "loss_value": 0.0,
+                "external_loss_value": 0.0,
                 "curr_action_l1_loss": 0.0,
                 "next_actions_l1_loss": 0.0,
                 "action_count": 0.0,
                 "current_action_tokens": float(current_mask.sum().item()),
                 "next_action_tokens": float(next_mask.sum().item()),
             }
-    return loss, metrics, normalized_actions.detach()
+    return loss, metrics, external_actions.detach()
 
 
 def native_run_forward_pass(
@@ -619,6 +810,16 @@ def save_component_checkpoint(bundle: ModelBundle, checkpoint_dir: Path, step: i
         raise RuntimeError("CSGO Seen-10 checkpoints require the native PEFT LoRA adapter")
     bundle.processor.save_pretrained(checkpoint_dir)
     torch.save(bundle.action_head.state_dict(), checkpoint_dir / f"action_head--{step}_checkpoint.pt")
+    if bundle.action_normalization is not None and bundle.action_normalization.mode != "none":
+        bundle.action_normalization.save(checkpoint_dir / "action_normalization.json")
+    if bundle.model_recipe is not None:
+        recipe_file = checkpoint_dir / "model_recipe.json"
+        temporary = recipe_file.with_name(recipe_file.name + ".tmp")
+        temporary.write_text(
+            json.dumps(bundle.model_recipe, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(recipe_file)
 
 
 def sha256_file(path: str | os.PathLike[str]) -> str:

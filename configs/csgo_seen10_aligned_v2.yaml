@@ -1,0 +1,60 @@
+# Approved Seen-10 localization recipe. Does not launch anything on its own.
+recipe_id: openvla_oft_seen10_aligned_v2
+model_path: checkpoints/openvla-7b
+# Verified against the original official snapshot; see weight_integrity.json.
+base_shard_sha256:
+  model-00001-of-00003.safetensors: 10d8636256018712c5e5c823d12e22b5797f99bb721bd123bf6bf2379892be85
+  model-00002-of-00003.safetensors: 2050b14f21d48904d269f48d5a980fecea87cd7b36641d9b0f015e72d1fe216a
+  model-00003-of-00003.safetensors: ea65305a1577f36f721965bf84c8caec0a948ce7ce84d754701637376c531fef
+data_root: /home/jiahao/task/UniLIP/data/csgo_benchmark_v2
+output_root: outputs/csgo_benchmark_v2_seen10_aligned_v2
+smoke_output_root: outputs/csgo_benchmark_v2_seen10_aligned_v2_smoke
+shared_eval_dir: /home/jiahao/task/csgo_benchmark_v2_eval_general
+unilip_python: /home/jiahao/miniconda3/envs/UniLIP/bin/python
+maps: [cs_agency, cs_italy, de_ancient, de_anubis, de_dust2, de_inferno,
+       de_mirage, de_nuke, de_overpass, de_train]
+
+freeze_vision: true
+freeze_vl_projector: true
+use_lora: true
+lora_scope: official_all_linear_excluding_frozen_modules
+lora_rank: 32
+lora_alpha: 16
+lora_dropout: 0.0
+gradient_checkpointing: true
+
+action_dim: 5
+action_horizon: 1
+use_proprio: false
+use_l1_regression: true
+action_normalization: bounds_q99
+normalization_stats_split: seen_train
+clip_training_targets: true
+clip_predictions: false
+fpv_augmentation: oft_photometric_only
+radar_augmentation: oft_photometric_only
+
+batch_size: 1
+grad_accumulation_steps: 128
+effective_batch_size: 128
+sampler_policy: global_full_update_batches
+val_batch_size: 1
+inference_batch_size: 1
+num_workers: 0
+
+learning_rate: 0.0005
+weight_decay: 0.01
+adam_betas: [0.9, 0.999]
+adam_eps: 1.0e-8
+lr_warmup_steps: 0
+num_steps_before_decay: 100000
+scheduler_gamma: 0.1
+max_steps: 19500
+# Includes a final event even though 19500 is not divisible by 4000.
+event_every: 4000
+checkpoint_selection: late
+validation_selection_metric: external_normalized_l1
+
+smoke_max_steps: 5
+smoke_samples_per_map: 10
+visual_samples_per_map: 10
