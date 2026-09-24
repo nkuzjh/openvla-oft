@@ -6,11 +6,11 @@ base_shard_sha256:
   model-00001-of-00003.safetensors: 10d8636256018712c5e5c823d12e22b5797f99bb721bd123bf6bf2379892be85
   model-00002-of-00003.safetensors: 2050b14f21d48904d269f48d5a980fecea87cd7b36641d9b0f015e72d1fe216a
   model-00003-of-00003.safetensors: ea65305a1577f36f721965bf84c8caec0a948ce7ce84d754701637376c531fef
-data_root: /home/jiahao/task/UniLIP/data/csgo_benchmark_v2
+data_root: ../UniLIP/data/csgo_benchmark_v2
 output_root: outputs/csgo_benchmark_v2_seen10_aligned_v2
 smoke_output_root: outputs/csgo_benchmark_v2_seen10_aligned_v2_smoke
-shared_eval_dir: /home/jiahao/task/csgo_benchmark_v2_eval_general
-unilip_python: /home/jiahao/miniconda3/envs/UniLIP/bin/python
+shared_eval_dir: ../csgo_benchmark_v2_eval_general
+unilip_python: .venv/bin/python
 maps: [cs_agency, cs_italy, de_ancient, de_anubis, de_dust2, de_inferno,
        de_mirage, de_nuke, de_overpass, de_train]
 

@@ -2,14 +2,14 @@
 
 本文是 Seen-10 定位任务的运行说明，记录环境、命令、输出和当前结果。实验设计、实现边界、横向比较与验收证据统一维护在 [CSGO_SEEN10_PLAN.md](CSGO_SEEN10_PLAN.md)。两份文档同时覆盖首次接入的 legacy 和当前已实现的 aligned v2；正式训练、全量推理及评测由使用者手动启动。
 
-记录更新：2026-09-24。本次仅整理文档，未运行训练、推理、评测或模型测试。
+记录更新：2026-09-24。已增加跨服务器路径解析和环境/下载检查入口；本次只执行路径与脚本检查，未运行训练、推理、评测或模型前后向。
 
 ## 1. 实验范围与数据
 
 只接入 localization，不含生成任务或 CrossMap。输入为当前 FPV RGB、对应地图 radar 和包含地图名的定位指令；不输入 GT 坐标、历史位姿或 robot state。输出为单步 5D pose `[x,y,z,pitch,yaw]`。
 
-- 数据：`/home/jiahao/task/UniLIP/data/csgo_benchmark_v2`，直接读取发布 manifest、split 和 calibration，不扫描图片重新划分。
-- 共享评测器：`/home/jiahao/task/csgo_benchmark_v2_eval_general`；数据适配也依赖其纯 Python `protocol.py`。
+- 数据：`../UniLIP/data/csgo_benchmark_v2`（相对 OpenVLA 项目根目录），直接读取发布 manifest、split 和 calibration，不扫描图片重新划分。
+- 共享评测器：`../csgo_benchmark_v2_eval_general`；数据适配也依赖其纯 Python `protocol.py`。
 - 固定地图顺序：`cs_agency, cs_italy, de_ancient, de_anubis, de_dust2, de_inferno, de_mirage, de_nuke, de_overpass, de_train`。
 - `seen_train` 50,000 条、`seen_validation` 5,000 条、`seen_discrete_test` 20,000 条；每图分别 5,000 / 500 / 2,000 条。
 - 外部标准预测使用 `[x/1024, y/1024, (z-zmin)/(zmax-zmin), pitch_rad/(2π), yaw_rad/(2π)]`。Z 使用发布的固定逐地图范围，分母无 epsilon，不裁剪预测。
@@ -36,28 +36,79 @@
 
 aligned 与 UniLIP `exp32_loc` 对齐输入信息、split、外部 5D、有效 batch、更新数和定位曝光；保留用户批准的 Qnorm/clip、颜色增强和 OFT 原生优化配置，因此并非逐项相同的训练配方。比较边界见 PLAN。`exp32` 的定位结果仅作联合训练的次要比较对象。
 
-## 3. 环境与原始权重
+## 3. 环境、模型下载与两台服务器路径
 
-以下命令均从 `/home/jiahao/task/openvla-oft` 执行。当前本机环境与权重已经准备完成；仅新环境需要执行安装脚本：
+推荐目录布局如下；同样适用于原服务器 `/home/jiahao/task/`。路径由 checkout 所在位置推导，不依赖用户名或启动命令时的工作目录。
 
-```bash
-cd /home/jiahao/task/openvla-oft
-bash scripts/setup_csgo_seen10.sh
+```text
+/home/user/yc57963/task/
+  openvla-oft/
+    .venv/
+    checkpoints/openvla-7b/
+    checkpoints/huggingface/
+    outputs/
+  UniLIP/data/csgo_benchmark_v2/
+  csgo_benchmark_v2_eval_general/
+    run_eval.py
+    protocol.py
 ```
 
-脚本默认安装依赖并准备模型；`--skip-model` 只跳过模型下载，仍会安装依赖。项目使用独立 `.venv`：Python 3.11、PyTorch 2.7.1+cu128、Torchvision 0.22.1、PEFT 0.11.1，以及 [requirements-csgo-seen10.txt](requirements-csgo-seen10.txt) 固定的 OFT Transformers fork，不向 UniLIP 环境安装项目依赖。
+### 3.1 新服务器准备
 
-初始化使用原始 `openvla/openvla-7b`，本地目录 `checkpoints/openvla-7b/`。aligned 配置固定三个权重 shard 的 SHA256，启动时重新校验，不从旧 CSGO adapter 热启动。原始资产核验见 [weight_integrity.json](outputs/csgo_seen10_validation/weight_integrity.json)。该 base 不含一个可直接复用的 OFT 7D 连续 head；本项目新建 5D×1 head。
-
-默认路径已写入 YAML。需要迁移数据或 evaluator 时可设置：
+在新服务器项目根目录执行。环境安装与模型下载可分开运行：
 
 ```bash
-export CSGO_DATA_ROOT=/home/jiahao/task/UniLIP/data/csgo_benchmark_v2
-export SHARED_EVAL_DIR=/home/jiahao/task/csgo_benchmark_v2_eval_general
-export UNILIP_PYTHON=/home/jiahao/miniconda3/envs/UniLIP/bin/python
+cd /home/user/yc57963/task/openvla-oft
+bash scripts/setup_csgo_seen10.sh --dry-run
+bash scripts/setup_csgo_seen10.sh --skip-model
+./.venv/bin/python scripts/download_csgo_model.py --dry-run
+./.venv/bin/python scripts/download_csgo_model.py
 ```
 
-数据路径优先级为 `CSGO_DATA_ROOT > DATA_ROOT > YAML`。注意清理不再使用的环境变量，避免覆盖配置中的路径。
+也可用 `bash scripts/setup_csgo_seen10.sh` 一次完成环境安装、模型下载及 CUDA 检查，保留原命令行为。安装使用 Python 3.11，自动从 PATH 寻找，或由 Conda 创建项目内环境；可通过 `OPENVLA_SETUP_PYTHON=/实际路径/python3.11` 指定创建环境的解释器。不再依赖旧服务器 UniLIP Conda 环境。
+
+依赖保持 PyTorch 2.7.1+cu128、Torchvision 0.22.1+cu128、PEFT 0.11.1 及 [requirements-csgo-seen10.txt](requirements-csgo-seen10.txt) 固定的 OFT Transformers fork。仍要求适配 CUDA 12.8 的驱动；路径适配不自动改变 CUDA/模型配方。共享定位评测默认由本项目 `.venv/bin/python` 执行，所需 PyYAML 显式列入依赖，不需要另建名为 UniLIP 的环境，也无需安装生成任务评测依赖。
+
+模型下载工具使用官方 `openvla/openvla-7b`，支持已有文件校验、断点续传与 SHA256 校验；默认落在本项目 `checkpoints/openvla-7b`，缓存保持在项目内。aligned 启动仍按 YAML 固定的三个原始 shard SHA256 复核，不从旧 CSGO adapter 热启动。该 base 不含一个可直接复用的 OFT 7D 连续 head，本项目新建 5D×1 head。原服务器历史资产核验见 [weight_integrity.json](outputs/csgo_seen10_validation/weight_integrity.json)。
+
+只检查已准备的环境和本地模型文件，不安装、下载或初始化 CUDA：
+
+```bash
+bash scripts/setup_csgo_seen10.sh --check
+```
+
+`--check` 的模型部分只检查本地文件存在，不替代下载时或 aligned 启动时的完整权重哈希核验。Git 不同步 `.venv`、模型、benchmark 数据、共享 evaluator 和历史 outputs；需在新服务器单独准备完整数据 bundle 与 evaluator 目录。不要直接把原机器 `.venv` 当作可迁移环境；脚本会拒绝检测到的断链或指向旧位置的环境，需在新服务器重建。
+
+### 3.2 路径覆盖与启动前核对
+
+默认 YAML 使用项目相对路径。解析优先级为 **显式路径 CLI → 环境变量 → YAML → 同级目录默认值**。所有相对文件路径以 OpenVLA 项目根目录为基准；Python 可执行文件保留 `.venv/bin/python` 路径，不解析 symlink 到其基础解释器。
+
+| 用途 | 默认 | 环境变量 | CLI |
+| --- | --- | --- | --- |
+| Benchmark 数据 | `../UniLIP/data/csgo_benchmark_v2` | `CSGO_DATA_ROOT`，兼容 `DATA_ROOT` | `--data-root` |
+| 共享 evaluator | `../csgo_benchmark_v2_eval_general` | `SHARED_EVAL_DIR`，兼容 `CSGO_EVAL_ROOT` | `--eval-root` |
+| evaluator Python | `.venv/bin/python` | `UNILIP_PYTHON` | `--unilip-python` |
+| 原始模型目录 | `checkpoints/openvla-7b` | `OPENVLA_MODEL_PATH`，下载工具也读取 | `--model-path` |
+
+旧 YAML 中原服务器的三个默认绝对路径在存在时沿用，不存在时迁移到同级数据/evaluator及本地 `.venv`；用户自定义的路径和显式覆盖不会被静默替换。两个数据变量同时存在时 `CSGO_DATA_ROOT` 优先；两个 evaluator 变量同时存在时 `SHARED_EVAL_DIR` 优先。清理不再使用的旧环境变量，避免覆盖 YAML。
+
+布局不同时可在同一 shell 设置：
+
+```bash
+export CSGO_DATA_ROOT=/home/user/yc57963/task/UniLIP/data/csgo_benchmark_v2
+export SHARED_EVAL_DIR=/home/user/yc57963/task/csgo_benchmark_v2_eval_general
+export UNILIP_PYTHON=/home/user/yc57963/task/openvla-oft/.venv/bin/python
+```
+
+训练、推理、评测共用解析规则。只打印实际路径、不加载模型、不创建实验目录：
+
+```bash
+bash scripts/run_csgo_seen10.sh train --config configs/csgo_seen10_aligned_v2.yaml --seed 42 --print-paths
+bash scripts/run_csgo_seen10.sh infer --config configs/csgo_seen10_aligned_v2.yaml --seed 42 --print-paths
+bash scripts/run_csgo_seen10.sh eval --config configs/csgo_seen10_aligned_v2.yaml --seed 42 --print-paths
+```
+
+`--print-paths` 只检查解析结果，不承诺文件已齐全。当前改动支持在新服务器从原始 base 新建同配方实验，未放宽旧 checkpoint 中记录的绝对路径/数据身份恢复检查；跨路径迁移旧训练状态不能直接视为已经支持。
 
 ## 4. 手动执行与恢复
 
@@ -110,10 +161,10 @@ legacy 同样支持训练的 `--resume-checkpoint`，以及推理的 `--checkpoi
 正式 evaluator 要求完整 20,000 条 coverage。仅重评已有 legacy 预测时，可直接调用共享入口，写入未使用的目录：
 
 ```bash
-/home/jiahao/miniconda3/envs/UniLIP/bin/python \
-  /home/jiahao/task/csgo_benchmark_v2_eval_general/run_eval.py localization \
+./.venv/bin/python \
+  ../csgo_benchmark_v2_eval_general/run_eval.py localization \
   --pred-root outputs/csgo_benchmark_v2_seen10/OpenVLA-OFT/seed_0/localization \
-  --data-root /home/jiahao/task/UniLIP/data/csgo_benchmark_v2 \
+  --data-root ../UniLIP/data/csgo_benchmark_v2 \
   --pose-space normalized \
   --output outputs/csgo_benchmark_v2_seen10/OpenVLA-OFT/seed_0/evaluation/localization_recheck
 ```

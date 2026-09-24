@@ -7,7 +7,7 @@ import os
 
 os.environ.setdefault("OPENVLA_ROBOT_PLATFORM", "CSGO")
 
-from csgo_seen10.runner import build_arg_parser, inference, load_config
+from csgo_seen10.cli import build_arg_parser, load_cli_config, print_paths
 
 
 def main() -> None:
@@ -15,7 +15,12 @@ def main() -> None:
     parser.add_argument("--checkpoint", default=None, help="best/late checkpoint or run directory")
     parser.add_argument("--resume", action="store_true", help="fill only missing sample IDs in an existing JSONL")
     args = parser.parse_args()
-    config = load_config(args.config)
+    config = load_cli_config(args)
+    if args.print_paths:
+        print_paths(config, args)
+        return
+    from csgo_seen10.runner import inference
+
     inference(config, seed=args.seed, checkpoint=args.checkpoint, smoke=args.smoke, resume=args.resume)
 
 

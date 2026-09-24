@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import math
@@ -20,7 +19,6 @@ os.environ.setdefault("OPENVLA_ROBOT_PLATFORM", "CSGO")
 import numpy as np
 import torch
 import torch.distributed as dist
-import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
@@ -29,6 +27,8 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 from .data import SEEN10_MAPS, CSGOSeen10Dataset
 from .action_normalization import ActionNormalization, fit_seen_train_stats
 from .sampling import GlobalUpdateSampler, event_steps
+from . import paths
+from .cli import build_arg_parser, load_config
 from .model import (
     ModelBundle,
     collate_samples,
@@ -40,8 +40,8 @@ from .model import (
     sha256_file,
 )
 
-DEFAULT_DATA_ROOT = "/home/jiahao/task/UniLIP/data/csgo_benchmark_v2"
-DEFAULT_SHARED_EVAL_DIR = "/home/jiahao/task/csgo_benchmark_v2_eval_general"
+DEFAULT_DATA_ROOT = paths.DEFAULT_DATA_ROOT
+DEFAULT_SHARED_EVAL_DIR = paths.DEFAULT_SHARED_EVAL_DIR
 DEFAULT_MODEL_PATH = "checkpoints/openvla-7b"
 DEFAULT_OUTPUT_ROOT = "outputs/csgo_benchmark_v2_seen10"
 MODEL_NAME = "OpenVLA-OFT"
@@ -127,16 +127,6 @@ def _nested_get(config: Mapping[str, Any], path: Sequence[str], default: Any = N
     return value
 
 
-def load_config(path: str | os.PathLike[str]) -> dict[str, Any]:
-    config_path = Path(path).expanduser().resolve()
-    with config_path.open("r", encoding="utf-8") as stream:
-        config = yaml.safe_load(stream)
-    if not isinstance(config, dict):
-        raise ValueError(f"Config must be a mapping: {config_path}")
-    config["_config_path"] = str(config_path)
-    return config
-
-
 def _config_value(config: Mapping[str, Any], key: str, default: Any = None) -> Any:
     if key in config:
         return config[key]
@@ -155,32 +145,21 @@ def _selected_maps(config: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 def _data_root(config: Mapping[str, Any]) -> str:
-    return str(
-        os.environ.get(
-            "CSGO_DATA_ROOT",
-            os.environ.get(
-                "DATA_ROOT",
-                config.get("data_root", config.get("data", {}).get("root", DEFAULT_DATA_ROOT)),
-            ),
-        )
-    )
+    return str(paths.data_root(config).resolve())
 
 
 def _model_path(config: Mapping[str, Any]) -> str:
-    return str(config.get("model_path", config.get("model", {}).get("path", DEFAULT_MODEL_PATH)))
+    return paths.model_path(config)
 
 
 def _configure_data_environment(config: Mapping[str, Any]) -> None:
     """Pass config-based protocol location to the lazy data adapter."""
 
-    os.environ.setdefault(
-        "SHARED_EVAL_DIR",
-        str(config.get("shared_eval_dir", os.environ.get("SHARED_EVAL_DIR", DEFAULT_SHARED_EVAL_DIR))),
-    )
+    os.environ["SHARED_EVAL_DIR"] = str(paths.evaluator_root(config))
 
 
 def _output_root(config: Mapping[str, Any]) -> Path:
-    return Path(config.get("output_root", DEFAULT_OUTPUT_ROOT)).expanduser().resolve()
+    return paths.project_path(config.get("output_root", DEFAULT_OUTPUT_ROOT)).resolve()
 
 
 def _seed_output_dir(config: Mapping[str, Any], seed: int) -> Path:
@@ -188,7 +167,7 @@ def _seed_output_dir(config: Mapping[str, Any], seed: int) -> Path:
 
 
 def _smoke_output_dir(config: Mapping[str, Any], seed: int) -> Path:
-    root = Path(config.get("smoke_output_root", "outputs/csgo_benchmark_v2_seen10_smoke")).expanduser().resolve()
+    root = paths.project_path(config.get("smoke_output_root", "outputs/csgo_benchmark_v2_seen10_smoke")).resolve()
     return root / MODEL_NAME / f"seed_{int(seed)}"
 
 
@@ -548,7 +527,7 @@ def save_checkpoint(
 
 
 def _find_resume_checkpoint(path: str | os.PathLike[str], *, prefer: str = "late") -> Path:
-    candidate = Path(path).expanduser().resolve()
+    candidate = paths.project_path(path).resolve()
     if candidate.is_dir() and (candidate / "adapter_config.json").is_file():
         return candidate
     if candidate.is_dir() and (candidate / "lora_adapter" / "adapter_config.json").is_file():
@@ -1628,14 +1607,8 @@ def eval_command(config: Mapping[str, Any], *, seed: int, smoke: bool = False) -
     run_dir = _smoke_output_dir(config, seed) if smoke else _seed_output_dir(config, seed)
     pred_root = run_dir / "localization"
     output = run_dir / "evaluation" / ("smoke_localization.json" if smoke else "localization")
-    evaluator = (
-        Path(os.environ.get("SHARED_EVAL_DIR", config.get("shared_eval_dir", DEFAULT_SHARED_EVAL_DIR)))
-        / "run_eval.py"
-    )
-    evaluator_python = os.environ.get(
-        "UNILIP_PYTHON",
-        str(config.get("unilip_python", "/home/jiahao/miniconda3/envs/UniLIP/bin/python")),
-    )
+    evaluator = paths.evaluator_root(config) / "run_eval.py"
+    evaluator_python = str(paths.evaluator_python(config))
     if smoke:
         command = [
             evaluator_python,
@@ -1662,14 +1635,6 @@ def eval_command(config: Mapping[str, Any], *, seed: int, smoke: bool = False) -
             str(output),
         ]
     return subprocess.call(command)
-
-
-def build_arg_parser(description: str) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--config", default="configs/csgo_seen10.yaml")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--smoke", action="store_true")
-    return parser
 
 
 __all__ = [

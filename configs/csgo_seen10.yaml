@@ -3,11 +3,11 @@
 # presentations of the 50,000-row training split), with validation/checkpoint
 # events at steps 3,900, 7,800, 11,700, 15,600 and 19,500.
 model_path: checkpoints/openvla-7b
-data_root: /home/jiahao/task/UniLIP/data/csgo_benchmark_v2
+data_root: ../UniLIP/data/csgo_benchmark_v2
 output_root: outputs/csgo_benchmark_v2_seen10
 smoke_output_root: outputs/csgo_benchmark_v2_seen10_smoke
-shared_eval_dir: /home/jiahao/task/csgo_benchmark_v2_eval_general
-unilip_python: /home/jiahao/miniconda3/envs/UniLIP/bin/python
+shared_eval_dir: ../csgo_benchmark_v2_eval_general
+unilip_python: .venv/bin/python
 maps:
   - cs_agency
   - cs_italy

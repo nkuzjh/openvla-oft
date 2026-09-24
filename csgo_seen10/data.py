@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from . import paths
+
 try:
     from torch.utils.data import Dataset as _TorchDataset
 except ImportError:  # pragma: no cover - allows metadata-only inspection
@@ -64,8 +66,8 @@ _SPLIT_ALIASES = {
     "continuous": "seen_continuous",
 }
 
-_DEFAULT_DATA_ROOT = "/home/jiahao/task/UniLIP/data/csgo_benchmark_v2"
-_DEFAULT_SHARED_EVAL_DIR = "/home/jiahao/task/csgo_benchmark_v2_eval_general"
+_DEFAULT_DATA_ROOT = str(paths.data_root({}))
+_DEFAULT_SHARED_EVAL_DIR = str(paths.evaluator_root({}))
 
 
 def _shared_protocol_class() -> type:
@@ -77,7 +79,7 @@ def _shared_protocol_class() -> type:
     calibration, path and count validation.
     """
 
-    shared_dir = Path(os.environ.get("SHARED_EVAL_DIR", _DEFAULT_SHARED_EVAL_DIR)).expanduser()
+    shared_dir = paths.evaluator_root({})
     protocol_path = (shared_dir / "protocol.py").resolve()
     if not protocol_path.is_file():
         raise FileNotFoundError(
@@ -297,11 +299,11 @@ class Seen10Dataset(_TorchDataset):
         max_samples: int | None = None,
     ) -> None:
         if data_root is None:
-            data_root = os.environ.get("CSGO_DATA_ROOT", os.environ.get("DATA_ROOT", _DEFAULT_DATA_ROOT))
+            data_root = paths.data_root({})
         canonical_split = _canonical_split(split)
         if max_samples is not None and max_samples < 0:
             raise ValueError("max_samples must be non-negative")
-        self.data_root = Path(data_root).expanduser().resolve()
+        self.data_root = paths.project_path(data_root).resolve()
         benchmark_data = _shared_protocol_class()(self.data_root)
         if tuple(benchmark_data.maps) != SEEN10_MAPS:
             raise ValueError(f"Published map order differs from Seen-10: {benchmark_data.maps!r}")

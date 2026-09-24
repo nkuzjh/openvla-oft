@@ -10,7 +10,7 @@ NPROC="${NPROC_PER_NODE:-1}"
 TORCHRUN=("${PYTHON_BIN}" -m torch.distributed.run)
 
 usage() {
-    echo "Usage: $0 {smoke|train|infer|eval} [--config PATH] [--seed N] [options]" >&2
+    echo "Usage: $0 {smoke|train|infer|eval} [--config PATH] [--seed N] [--print-paths] [options]" >&2
     exit 2
 }
 
@@ -18,6 +18,17 @@ usage() {
 COMMAND="$1"
 shift
 export OPENVLA_ROBOT_PLATFORM="${OPENVLA_ROBOT_PLATFORM:-CSGO}"
+
+# Inspect paths without torchrun, GPU discovery, or importing the model stack.
+for arg in "$@"; do
+    if [[ "${arg}" == --print-paths ]]; then
+        case "${COMMAND}" in
+            train|infer|eval) exec "${PYTHON_BIN}" "${COMMAND}_seen10.py" "$@" ;;
+            smoke) exec "${PYTHON_BIN}" train_seen10.py --smoke "$@" ;;
+            *) usage ;;
+        esac
+    fi
+done
 
 case "${COMMAND}" in
     smoke)

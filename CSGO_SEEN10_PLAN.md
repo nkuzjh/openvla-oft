@@ -1,6 +1,6 @@
 # OpenVLA-OFT · CSGO Seen-10 实验设计与验收记录
 
-本文记录已实现的 legacy / aligned v2 的设计、配置依据、实现边界和验收证据。环境、手动运行命令、输出目录和正式结果见 [CSGO_SEEN10.md](CSGO_SEEN10.md)。记录更新于 2026-09-24，代码工作基于 `main@41c7227ce3bdfe48acfef7a6104958836201b0f7` 及工作区中的 aligned 变更；本次整理只修改这两份文档，不重新运行模型或实验。
+本文记录已实现的 legacy / aligned v2 的设计、配置依据、实现边界和验收证据。环境、手动运行命令、输出目录和正式结果见 [CSGO_SEEN10.md](CSGO_SEEN10.md)。记录更新于 2026-09-24，代码工作基于 `main@41c7227ce3bdfe48acfef7a6104958836201b0f7` 及工作区中的 aligned 变更；文档整理后已补充跨服务器路径适配，见第 7.3 节；不重新运行模型或正式实验。
 
 文档结构与记录范围参考 [X-VLA 运行说明](../X-VLA/CSGO_SEEN10.md)、[X-VLA 方案](../X-VLA/CSGO_SEEN10_PLAN.md)、[RDT 运行说明](../RoboticsDiffusionTransformer/CSGO_SEEN10.md) 和 [RDT 方案及验收](../RoboticsDiffusionTransformer/CSGO_SEEN10_PLAN.md)。各项目的结构、配置和验收结果分别记录，不相互借用完成状态。
 
@@ -155,7 +155,7 @@ LoRA 固定 `r=32, alpha=16, dropout=0, bias=none, init=gaussian`。`_aligned_li
 
 ### 7.1 配置如何成为运行值
 
-`load_config` 读取 YAML；通用 `_config_value` 顺序为顶层字段 → `train.<key>` → `model.<key>` → 代码默认。地图、路径等字段有各自解析函数；数据路径另受 `CSGO_DATA_ROOT > DATA_ROOT > YAML` 控制。共享 evaluator 和 Python 可由 `SHARED_EVAL_DIR`、`UNILIP_PYTHON` 覆盖。CLI 只提供入口明示的 config、seed、smoke、resume/checkpoint 参数，不是任意 YAML key 覆盖器。
+`load_config` 读取 YAML；通用 `_config_value` 顺序为顶层字段 → `train.<key>` → `model.<key>` → 代码默认。地图、路径等字段有各自解析函数；数据路径另受 `CSGO_DATA_ROOT > DATA_ROOT > YAML` 控制。共享 evaluator 和 Python 可由 `SHARED_EVAL_DIR`、`UNILIP_PYTHON` 覆盖。CLI 提供 config、seed、smoke、resume/checkpoint，以及 data-root、eval-root、unilip-python、model-path 路径覆盖和只读 print-paths，不是任意 YAML key 覆盖器。路径 CLI 优先于环境变量，配置与相对路径统一以项目根目录解析；evaluator Python 默认使用项目 .venv，保留旧绝对路径的兼容回退，详见运行说明第 3 节。
 
 aligned 由 `recipe_id` 分派，`_validate_aligned_config` 对批准的固定语义作校验。`_aligned_recipe` / `resolved_recipe.json` 记录配方；`training_config.json` 与 `run_provenance.json` 记录解析结果和实际执行信息；`parameter_audit.json` 记录构建后的 optimizer，而 checkpoint 的 `training_state.json`、`optimizer.pt`、`scheduler.pt` 记录保存时状态。aligned 正式产物当前尚不存在，不以 YAML 代替运行完成的证据。
 
@@ -178,7 +178,20 @@ aligned 由 `recipe_id` 分派，`_validate_aligned_config` 对批准的固定�
 | [train_seen10.py](train_seen10.py)、[infer_seen10.py](infer_seen10.py)、[eval_seen10.py](eval_seen10.py) | 兼容命令入口；参数和路径用法见运行说明 |
 | [scripts/run_csgo_seen10.sh](scripts/run_csgo_seen10.sh) | train/infer 的 torchrun 包装；smoke 会实际串联三个阶段 |
 
-当前没有 `--dry-run`、`--output-root` 或 `RUN_FULL` 防执行开关；不能照搬 X-VLA/RDT 的专用参数。两个项目文档只作为组织范围参考，模型结构和运行行为以本项目代码为准。
+训练/推理/评测支持 `--print-paths`，此分支不导入模型、不执行阶段任务；它不是完整配置或权重验收。入口仍没有 `--dry-run`、`--output-root` 或 `RUN_FULL` 防执行开关。环境与下载脚本的 `--dry-run` 是各自独立功能，不能照搬到训练命令。
+
+### 7.3 跨服务器路径适配（2026-09-24）
+
+目标布局为 `/home/user/yc57963/task/openvla-oft`、同级 `UniLIP/data/csgo_benchmark_v2` 和 `csgo_benchmark_v2_eval_general`；原服务器同级布局继续可用。两份 YAML 仅修改数据/evaluator/Python 路径，不改变冻结、LoRA、Q99、增强、batch、预算、保存步骤或 seed 规则。
+
+- [paths.py](csgo_seen10/paths.py) 统一 CLI→环境变量→YAML→默认路径，文件相对 checkout 根解析，Python symlink 保留 venv 身份；仅旧服务器内置默认在缺失时允许回退，错误自定义路径不隐式替换。
+- [cli.py](csgo_seen10/cli.py) 提供轻量配置加载和 `--print-paths`，三个入口在路径检查后才导入训练运行时；wrapper 的路径模式绕开 torchrun。
+- 数据加载、原始模型、输出/checkpoint、恢复和 evaluator 使用同一项目根定位规则。旧 checkpoint 的路径/身份检查保留，未实现跨路径恢复转换。
+- [setup_csgo_seen10.sh](scripts/setup_csgo_seen10.sh) 去除固定 UniLIP Python 回退，支持指定 Python3.11、只读 dry-run/check 和迁移后环境检查；保持原 CUDA 12.8 依赖。
+- [download_csgo_model.py](scripts/download_csgo_model.py) 独立下载/续传官方 base，使用项目目录或 `OPENVLA_MODEL_PATH`；setup 默认仍下载，`--skip-model` 保持兼容。
+- evaluator 默认本地 `.venv/bin/python`；定位依赖 PyTorch/PyYAML 已由项目提供，不需引入完整生成评测依赖。原服务器历史指标不因默认解释器改变而重写；新服务器记录自己的依赖与运行 provenance。
+
+验证采用 [test_csgo_paths.py](tests/test_csgo_paths.py)：模拟新服务器根路径、CLI/env优先级、旧默认回退与错误自定义路径、Python symlink，以及外部 cwd 下三个入口不导入模型/不写实验产物。脚本语法、环境/下载 dry-run 与路径打印检查已通过。未在目标服务器实际安装或下载；旧主机上的这些检查不能证明新服务器驱动、网络及资产已经就绪。
 
 ## 8. 与原生 OFT、legacy 和 UniLIP 的比较边界
 
@@ -265,4 +278,4 @@ legacy 更新曝光为624,000；旧循环完整 epoch 尾部有16个 microbatch 
 - legacy训练 provenance 记录旧commit `e4287e9`，未保存可完全还原的当时dirty源码；已有输出可以核验，但不承诺当前重跑逐位等同历史运行。
 - UniLIP保存总量与定位激活量、原始权重完整哈希、部分历史推理拓扑/人工checkpoint决策未全部确认；本项目也未完成其统一evaluator重评。
 - Q99/clip、颜色增强、预训练语料、连续L1与flow MSE、内部维度和推理步数的差异已明确保留；结果解释必须受这些边界约束。
-- 本次文档整理没有修改代码/配置、依赖、UniLIP、数据或共享evaluator，没有启动训练、推理、评测；后续正式运行仍由用户手动执行。
+- 文档整理后的路径适配仅修改本项目入口、路径配置、环境/下载脚本及显式依赖，不修改 UniLIP、数据或共享 evaluator。未安装/下载或启动训练、推理、评测；后续正式运行仍由用户手动执行。

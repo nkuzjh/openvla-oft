@@ -8,10 +8,214 @@ VENV_DIR="${PROJECT_ROOT}/.venv"
 CHECKPOINT_ROOT="${PROJECT_ROOT}/checkpoints"
 HF_HOME_DIR="${CHECKPOINT_ROOT}/huggingface"
 MODEL_DIR="${CHECKPOINT_ROOT}/openvla-7b"
+if [[ -n "${OPENVLA_MODEL_PATH:-}" ]]; then
+    case "${OPENVLA_MODEL_PATH}" in
+        /*) MODEL_DIR="${OPENVLA_MODEL_PATH}" ;;
+        "~") MODEL_DIR="${HOME}" ;;
+        "~/"*) MODEL_DIR="${HOME}/${OPENVLA_MODEL_PATH#\~/}" ;;
+        *) MODEL_DIR="${PROJECT_ROOT}/${OPENVLA_MODEL_PATH}" ;;
+    esac
+fi
 REQ_FILE="${PROJECT_ROOT}/requirements-csgo-seen10.txt"
 SETUP_LOG_DIR="${PROJECT_ROOT}/outputs/setup_logs"
 PYPI_INDEX_URL="${CSGO_PYPI_INDEX_URL:-https://pypi.org/simple}"
 PYTORCH_INDEX_URL="${CSGO_PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/setup_csgo_seen10.sh [--skip-model] [--dry-run | --check] [--help]
+
+Create a project-local Python 3.11 environment, install pinned CUDA 12.8
+dependencies, download openvla/openvla-7b, and validate imports/CUDA.
+Set OPENVLA_SETUP_PYTHON to an installed Python 3.11 interpreter.
+--skip-model leaves the download to scripts/download_csgo_model.py.
+--dry-run shows planned actions without writes or network access.
+--check inspects the existing environment and local model without writes,
+network access, or CUDA initialization.
+EOF
+}
+
+SKIP_MODEL=0
+DRY_RUN=0
+CHECK_ONLY=0
+for arg in "$@"; do
+    case "${arg}" in
+        --skip-model) SKIP_MODEL=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        --check) CHECK_ONLY=1 ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Unknown argument: ${arg}" >&2; usage >&2; exit 2 ;;
+    esac
+done
+if (( DRY_RUN && CHECK_ONLY )); then
+    echo "Choose either --dry-run or --check." >&2
+    exit 2
+fi
+
+python311() {
+    "$1" -c 'import sys; print(sys.version.split()[0] if sys.version_info[:2] == (3, 11) else "")' 2>/dev/null
+}
+
+validate_python() {
+    local candidate="$1" version
+    if ! command -v "${candidate}" >/dev/null 2>&1; then
+        echo "Python interpreter not found: ${candidate}. Set OPENVLA_SETUP_PYTHON to Python 3.11." >&2
+        return 1
+    fi
+    version="$(python311 "${candidate}")" || true
+    if [[ -z "${version}" ]]; then
+        echo "${candidate} is not a working Python 3.11 interpreter." >&2
+        return 1
+    fi
+    echo "${version}"
+}
+
+check_venv() {
+    if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+        echo "Existing ${VENV_DIR} has no executable bin/python. It was preserved; repair or move it before retrying." >&2
+        return 1
+    fi
+    "${VENV_DIR}/bin/python" - "${VENV_DIR}" <<'PY'
+import sys
+from pathlib import Path
+
+expected = Path(sys.argv[1]).resolve()
+if Path(sys.prefix).resolve() != expected:
+    raise SystemExit(f"Existing .venv points to {sys.prefix}, expected {expected}; repair or move it before retrying.")
+if sys.version_info[:2] != (3, 11):
+    raise SystemExit(f"Existing .venv uses Python {sys.version.split()[0]}, expected 3.11.")
+cfg = expected / "pyvenv.cfg"
+conda_meta = expected / "conda-meta"
+if cfg.is_file():
+    if sys.prefix == sys.base_prefix:
+        raise SystemExit("Existing .venv is not isolated; repair or move it before retrying.")
+    if "include-system-site-packages = false" not in cfg.read_text().lower():
+        raise SystemExit("Existing .venv exposes system site-packages; repair or move it before retrying.")
+    for script in (expected / "bin").glob("pip*"):
+        if script.is_file():
+            with script.open("rb") as stream:
+                first_line = stream.readline(4096).decode("utf-8", "replace").strip()
+            if first_line.startswith("#!") and str(expected / "bin") not in first_line:
+                raise SystemExit(f"{script} points outside this .venv ({first_line}); repair or recreate the moved environment.")
+    activate = expected / "bin" / "activate"
+    if activate.is_file():
+        for line in activate.read_text().splitlines():
+            if line.startswith("VIRTUAL_ENV=") and str(expected) not in line:
+                raise SystemExit(f"{activate} points to an old location; repair or recreate the moved environment.")
+elif not conda_meta.is_dir():
+    raise SystemExit("Existing .venv has neither pyvenv.cfg nor conda-meta; repair or move it before retrying.")
+print(f"[setup] isolated Python {sys.version.split()[0]} at {sys.prefix}")
+PY
+}
+
+SELECTED_PYTHON=""
+if [[ -n "${OPENVLA_SETUP_PYTHON:-}" ]]; then
+    validate_python "${OPENVLA_SETUP_PYTHON}" >/dev/null
+    SELECTED_PYTHON="${OPENVLA_SETUP_PYTHON}"
+fi
+if [[ -e "${VENV_DIR}" || -L "${VENV_DIR}" ]]; then
+    check_venv
+else
+    if (( CHECK_ONLY )); then
+        echo "[setup] missing environment: ${VENV_DIR}" >&2
+        exit 1
+    fi
+    if [[ -z "${SELECTED_PYTHON}" ]]; then
+        for candidate in python3.11 python3 python; do
+            if command -v "${candidate}" >/dev/null 2>&1 && [[ -n "$(python311 "${candidate}" || true)" ]]; then
+                SELECTED_PYTHON="$(command -v "${candidate}")"
+                break
+            fi
+        done
+    fi
+    if [[ -z "${SELECTED_PYTHON}" ]]; then
+        if [[ -n "${CONDA_EXE:-}" && -x "${CONDA_EXE}" ]]; then
+            CONDA_BIN="${CONDA_EXE}"
+        else
+            CONDA_BIN="$(command -v conda || true)"
+        fi
+        if [[ -z "${CONDA_BIN}" ]]; then
+            echo "Python 3.11 or Conda is required. Set OPENVLA_SETUP_PYTHON to a Python 3.11 interpreter." >&2
+            exit 1
+        fi
+    fi
+fi
+
+echo "[setup] root: ${PROJECT_ROOT}"
+echo "[setup] environment: ${VENV_DIR}"
+echo "[setup] Hugging Face cache: ${HF_HOME_DIR}"
+echo "[setup] model: ${MODEL_DIR}"
+if (( DRY_RUN )); then
+    if [[ ! -e "${VENV_DIR}" && ! -L "${VENV_DIR}" ]]; then
+        if [[ -n "${SELECTED_PYTHON}" ]]; then
+            echo "[setup] would create Python 3.11 venv with ${SELECTED_PYTHON}"
+        else
+            echo "[setup] would create Python 3.11 Conda prefix with ${CONDA_BIN}"
+        fi
+    fi
+    echo "[setup] would install pinned torch==2.7.1+cu128, torchvision==0.22.1+cu128, torchaudio==2.7.1+cu128 and ${REQ_FILE}"
+    if (( ! SKIP_MODEL )); then
+        if [[ -e "${VENV_DIR}" || -L "${VENV_DIR}" ]]; then
+            "${VENV_DIR}/bin/python" "${PROJECT_ROOT}/scripts/download_csgo_model.py" --dry-run
+        elif [[ -n "${SELECTED_PYTHON}" ]]; then
+            "${SELECTED_PYTHON}" "${PROJECT_ROOT}/scripts/download_csgo_model.py" --dry-run
+        else
+            echo "[model] would query the official Hub manifest and resume/verify files into ${MODEL_DIR}"
+        fi
+    fi
+    echo "[setup] would validate imports and CUDA"
+    exit 0
+fi
+
+if (( CHECK_ONLY )); then
+    "${VENV_DIR}/bin/python" - "${PROJECT_ROOT}" <<'PY'
+from importlib import metadata
+import json
+import site
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+pins = {"torch": "2.7.1+cu128", "torchvision": "0.22.1+cu128", "torchaudio": "2.7.1+cu128"}
+for name, expected in pins.items():
+    try:
+        actual = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        raise SystemExit(f"[setup] missing package: {name}")
+    if actual != expected:
+        raise SystemExit(f"[setup] {name} is {actual}, expected {expected}")
+    print(f"[setup] {name}=={actual}")
+for name in ("openvla-oft", "transformers", "peft", "accelerate", "diffusers", "PyYAML", "numpy", "Pillow"):
+    try:
+        print(f"[setup] {name}=={metadata.version(name)}")
+    except metadata.PackageNotFoundError:
+        raise SystemExit(f"[setup] missing package: {name}")
+distribution = next(
+    (
+        dist for dist in metadata.distributions(path=site.getsitepackages())
+        if dist.metadata["Name"].lower().replace("_", "-") == "openvla-oft"
+    ),
+    None,
+)
+if distribution is None:
+    raise SystemExit("[setup] openvla-oft is missing from this environment.")
+direct_url = distribution.read_text("direct_url.json")
+if not direct_url:
+    raise SystemExit("[setup] openvla-oft lacks editable install metadata; reinstall this checkout.")
+source = json.loads(direct_url)
+url = urlparse(source.get("url", ""))
+if not source.get("dir_info", {}).get("editable") or url.scheme != "file":
+    raise SystemExit("[setup] openvla-oft is not installed editable from this checkout.")
+installed_path = Path(unquote(url.path)).resolve()
+if installed_path != Path(sys.argv[1]).resolve():
+    raise SystemExit(f"[setup] openvla-oft points to {installed_path}; reinstall the moved checkout.")
+PY
+    if (( ! SKIP_MODEL )); then
+        "${VENV_DIR}/bin/python" "${PROJECT_ROOT}/scripts/download_csgo_model.py" --check
+    fi
+    echo "[setup] checks passed"
+    exit 0
+fi
 
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 # This setup entry point is specific to the CSGO Seen-10 native path.  Keep
@@ -41,36 +245,16 @@ fi
 
 mkdir -p "${CHECKPOINT_ROOT}" "${HF_HOME_DIR}" "${PIP_CACHE_DIR}" "${SETUP_LOG_DIR}"
 
-if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-    PYTHON311="$(command -v python3.11 || true)"
-    # The benchmark host exposes the supported 3.11 interpreter through the
-    # reference conda environment.  venv isolates site-packages, so nothing is
-    # installed into that environment; this is only a Python runtime fallback.
-    if [[ -z "${PYTHON311}" && -n "${UNILIP_PYTHON:-}" && -x "${UNILIP_PYTHON}" ]]; then
-        PYTHON311="${UNILIP_PYTHON}"
-    fi
-    if [[ -z "${PYTHON311}" && -x "/home/jiahao/miniconda3/envs/UniLIP/bin/python" ]]; then
-        PYTHON311="/home/jiahao/miniconda3/envs/UniLIP/bin/python"
-    fi
-
-    if [[ -n "${PYTHON311}" ]]; then
-        echo "[setup] creating project-local venv ${VENV_DIR} with $(${PYTHON311} -c 'import sys; print(sys.version.split()[0])')"
-        "${PYTHON311}" -m venv --without-pip "${VENV_DIR}"
+if [[ ! -e "${VENV_DIR}" && ! -L "${VENV_DIR}" ]]; then
+    if [[ -n "${SELECTED_PYTHON}" ]]; then
+        echo "[setup] creating project-local venv ${VENV_DIR} with ${SELECTED_PYTHON}"
+        "${SELECTED_PYTHON}" -m venv --without-pip "${VENV_DIR}"
+        check_venv
         curl --fail --silent --show-error https://bootstrap.pypa.io/get-pip.py | "${VENV_DIR}/bin/python" -
     else
-        if [[ -n "${CONDA_EXE:-}" && -x "${CONDA_EXE}" ]]; then
-            CONDA_BIN="${CONDA_EXE}"
-        elif command -v conda >/dev/null 2>&1; then
-            CONDA_BIN="$(command -v conda)"
-        else
-            CONDA_BIN=""
-        fi
-        if [[ -z "${CONDA_BIN}" ]]; then
-            echo "[setup] Python 3.11 or conda is required to create ${VENV_DIR}" >&2
-            exit 1
-        fi
-        echo "[setup] creating project-local conda prefix ${VENV_DIR} (Python 3.11)"
+        echo "[setup] creating project-local Conda prefix ${VENV_DIR} (Python 3.11)"
         "${CONDA_BIN}" create --prefix "${VENV_DIR}" python=3.11 pip -y
+        check_venv
     fi
 fi
 
@@ -93,129 +277,8 @@ echo "[setup] installing runtime dependencies from ${PYPI_INDEX_URL}"
 # those unrelated dependencies; the requirements file above is the CSGO set.
 "${PYTHON}" -m pip install --no-deps --editable "${PROJECT_ROOT}"
 
-if [[ "${1:-}" != "--skip-model" ]]; then
-    echo "[setup] downloading openvla/openvla-7b into ${MODEL_DIR}"
-    # Prefer resumable range downloads through the official Hub resolver.  The
-    # direct HTTP path also works when the optional Xet client is unavailable.
-    HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}" \
-        "${PYTHON}" - "${MODEL_DIR}" <<'PY'
-import json
-import hashlib
-import os
-import shutil
-import subprocess
-import sys
-import urllib.parse
-import urllib.request
-from pathlib import Path
-
-target = Path(sys.argv[1]).resolve()
-target.mkdir(parents=True, exist_ok=True)
-repo_id = "openvla/openvla-7b"
-revision = "main"
-api_url = f"https://huggingface.co/api/models/{repo_id}/tree/{revision}?recursive=true"
-with urllib.request.urlopen(api_url, timeout=60) as response:
-    entries = json.load(response)
-files = [entry for entry in entries if entry.get("type") == "file"]
-if not files:
-    raise RuntimeError("Hugging Face returned no files for openvla/openvla-7b")
-
-def download(entry: dict, output: Path) -> None:
-    size = entry.get("size")
-    lfs_oid = (entry.get("lfs") or {}).get("oid")
-
-    def verify_sha256(path: Path) -> bool:
-        if not isinstance(lfs_oid, str) or len(lfs_oid) != 64:
-            return True
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(16 * 1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest() == lfs_oid
-
-    if (
-        isinstance(size, int)
-        and output.is_file()
-        and output.stat().st_size == size
-        and verify_sha256(output)
-    ):
-        print(f"[setup] already complete {entry['path']} ({size} bytes)", flush=True)
-        return
-    if output.is_file() and output.stat().st_size:
-        print(
-            f"[setup] replacing incomplete materialized file {entry['path']} "
-            f"({output.stat().st_size} bytes; expected {size})",
-            flush=True,
-        )
-    partial = output.with_name(output.name + ".partial")
-    url = (
-        f"https://huggingface.co/{repo_id}/resolve/{revision}/"
-        f"{urllib.parse.quote(entry['path'], safe='/')}?download=true"
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    # A previous process may have finished the materialized bytes but exited
-    # before the atomic rename.  Verify and promote that file directly instead
-    # of asking the Hub to serve the already-complete shard again.
-    if (
-        isinstance(size, int)
-        and partial.is_file()
-        and partial.stat().st_size == size
-        and verify_sha256(partial)
-    ):
-        os.replace(partial, output)
-        aria2_control = partial.with_name(partial.name + ".aria2")
-        aria2_control.unlink(missing_ok=True)
-        print(f"[setup] materialized complete partial {entry['path']} ({size} bytes)", flush=True)
-        return
-    if shutil.which("aria2c") and (not isinstance(size, int) or size >= 8 * 1024 * 1024):
-        command = [
-            "aria2c", "--continue=true", "--allow-overwrite=true",
-            "--auto-file-renaming=false", "--file-allocation=none",
-            "--max-connection-per-server=16", "--split=16",
-            "--min-split-size=4M", "--summary-interval=10",
-            "--console-log-level=notice", "--retry-wait=5", "--max-tries=0",
-            "--connect-timeout=30", "--timeout=60", f"--out={partial.name}",
-            f"--dir={partial.parent}", url,
-        ]
-    else:
-        command = [
-            "curl", "--fail", "--location", "--continue-at", "-",
-            "--retry", "10", "--retry-delay", "5", "--retry-all-errors",
-            "--connect-timeout", "30", "--output", str(partial), url,
-        ]
-    result = subprocess.run(command)
-    if result.returncode and command[0] == "aria2c":
-        print(
-            f"[setup] aria2c failed for {entry['path']} (rc={result.returncode}); "
-            "retrying with curl resume",
-            flush=True,
-        )
-        subprocess.run(
-            [
-                "curl", "--fail", "--location", "--continue-at", "-",
-                "--retry", "10", "--retry-delay", "5", "--retry-all-errors",
-                "--connect-timeout", "30", "--output", str(partial), url,
-            ],
-            check=True,
-        )
-    elif result.returncode:
-        raise subprocess.CalledProcessError(result.returncode, command)
-    if isinstance(size, int) and partial.stat().st_size != size:
-        raise RuntimeError(
-            f"incomplete download for {entry['path']}: "
-            f"got {partial.stat().st_size}, expected {size}"
-        )
-    if not verify_sha256(partial):
-        raise RuntimeError(f"SHA-256 mismatch for {entry['path']}")
-    os.replace(partial, output)
-    aria2_control = partial.with_name(partial.name + ".aria2")
-    aria2_control.unlink(missing_ok=True)
-    print(f"[setup] materialized {entry['path']} ({output.stat().st_size} bytes)", flush=True)
-
-for entry in files:
-    download(entry, target / entry["path"])
-print(f"[setup] checkpoint ready: {target}")
-PY
+if (( ! SKIP_MODEL )); then
+    "${PYTHON}" "${PROJECT_ROOT}/scripts/download_csgo_model.py"
 fi
 
 echo "[setup] validating project-local imports and CUDA"
