@@ -35,11 +35,11 @@ clip_predictions: false
 fpv_augmentation: oft_photometric_only
 radar_augmentation: oft_photometric_only
 
-batch_size: 16
-grad_accumulation_steps: 8
+batch_size: 64
+grad_accumulation_steps: 2
 effective_batch_size: 128
 sampler_policy: global_full_update_batches
-val_batch_size: 16
+val_batch_size: 64
 inference_batch_size: 1
 num_workers: 0
 
