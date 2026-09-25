@@ -7,7 +7,8 @@ data_root: ../UniLIP/data/csgo_benchmark_v2
 output_root: outputs/csgo_benchmark_v2_seen10
 smoke_output_root: outputs/csgo_benchmark_v2_seen10_smoke
 shared_eval_dir: ../csgo_benchmark_v2_eval_general
-unilip_python: .venv/bin/python
+# null selects <shared_eval_dir>/.venv/bin/python; no environment fallback.
+unilip_python: null
 maps:
   - cs_agency
   - cs_italy

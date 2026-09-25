@@ -2,7 +2,7 @@
 
 本文是 Seen-10 定位任务的运行说明，记录环境、命令、输出和当前结果。实验设计、实现边界、横向比较与验收证据统一维护在 [CSGO_SEEN10_PLAN.md](CSGO_SEEN10_PLAN.md)。两份文档同时覆盖首次接入的 legacy 和当前已实现的 aligned v2；正式训练、全量推理及评测由使用者手动启动。
 
-记录更新：2026-09-24。已增加跨服务器路径解析和环境/下载检查入口；本次只执行路径与脚本检查，未运行训练、推理、评测或模型前后向。
+记录更新：2026-09-25。通用评测改为使用评测器项目自己的统一环境；本次安装独立评测环境并检查依赖/路径，不运行训练、推理或正式评测。
 
 ## 1. 实验范围与数据
 
@@ -51,6 +51,7 @@ aligned 与 UniLIP `exp32_loc` 对齐输入信息、split、外部 5D、有效 b
   csgo_benchmark_v2_eval_general/
     run_eval.py
     protocol.py
+    .venv/bin/python  # 所有定位项目共用的评测解释器
 ```
 
 ### 3.1 新服务器准备
@@ -67,7 +68,7 @@ bash scripts/setup_csgo_seen10.sh --skip-model
 
 也可用 `bash scripts/setup_csgo_seen10.sh` 一次完成环境安装、模型下载及 CUDA 检查，保留原命令行为。安装使用 Python 3.11，自动从 PATH 寻找，或由 Conda 创建项目内环境；可通过 `OPENVLA_SETUP_PYTHON=/实际路径/python3.11` 指定创建环境的解释器。不再依赖旧服务器 UniLIP Conda 环境。
 
-依赖保持 PyTorch 2.7.1+cu128、Torchvision 0.22.1+cu128、PEFT 0.11.1 及 [requirements-csgo-seen10.txt](requirements-csgo-seen10.txt) 固定的 OFT Transformers fork。仍要求适配 CUDA 12.8 的驱动；路径适配不自动改变 CUDA/模型配方。共享定位评测默认由本项目 `.venv/bin/python` 执行，所需 PyYAML 显式列入依赖，不需要另建名为 UniLIP 的环境，也无需安装生成任务评测依赖。
+依赖保持 PyTorch 2.7.1+cu128、Torchvision 0.22.1+cu128、PEFT 0.11.1 及 [requirements-csgo-seen10.txt](requirements-csgo-seen10.txt) 固定的 OFT Transformers fork。仍要求适配 CUDA 12.8 的驱动；路径适配不自动改变 CUDA/模型配方。OpenVLA 的训练/推理继续使用自身 `.venv`。定位评测默认由通用评测器项目的 `.venv/bin/python` 执行，该环境由用户单独安装，供其他定位项目直接复用；不再默认借用 OpenVLA 或 UniLIP 环境。
 
 模型下载工具使用官方 `openvla/openvla-7b`，支持已有文件校验、断点续传与 SHA256 校验；默认落在本项目 `checkpoints/openvla-7b`，缓存保持在项目内。aligned 启动仍按 YAML 固定的三个原始 shard SHA256 复核，不从旧 CSGO adapter 热启动。该 base 不含一个可直接复用的 OFT 7D 连续 head，本项目新建 5D×1 head。原服务器历史资产核验见 [weight_integrity.json](outputs/csgo_seen10_validation/weight_integrity.json)。
 
@@ -79,7 +80,25 @@ bash scripts/setup_csgo_seen10.sh --check
 
 `--check` 的模型部分只检查本地文件存在，不替代下载时或 aligned 启动时的完整权重哈希核验。Git 不同步 `.venv`、模型、benchmark 数据、共享 evaluator 和历史 outputs；需在新服务器单独准备完整数据 bundle 与 evaluator 目录。不要直接把原机器 `.venv` 当作可迁移环境；脚本会拒绝检测到的断链或指向旧位置的环境，需在新服务器重建。
 
-### 3.2 路径覆盖与启动前核对
+### 3.2 安装统一通用评测器环境
+
+同步完整的 `csgo_benchmark_v2_eval_general` 目录后，在目标服务器单独安装一次：
+
+```bash
+cd /home/user/yc57963/task/csgo_benchmark_v2_eval_general
+bash setup_env.sh
+cd /home/user/yc57963/task/openvla-oft
+```
+
+安装入口及固定依赖见 [评测器 README](../csgo_benchmark_v2_eval_general/README.md)。 默认安装命令也逐项准备生成评测权重：优先复用 UniLIP 缓存，缺失时下载至评测器 `loaded_models`。仅部署定位评测可用 `bash setup_env.sh --skip-weights`；定位训练/评测本身不需要这些生成指标权重。默认 CPU PyTorch 环境满足定位评测，避免不同模型项目的包版本影响评测；生成任务如需 GPU 可按该 README 显式选择 CUDA 后端。环境和评测器代码由用户自行部署；OpenVLA eval 不检查、不安装、不修复统一环境，也不会回退到模型环境，解释器未安装时直接由进程启动报错。
+
+若此前设置过指向 OpenVLA/UniLIP 的解释器环境变量，先取消覆盖以使用统一默认：
+
+```bash
+unset UNILIP_PYTHON CSGO_EVAL_PYTHON
+```
+
+### 3.3 路径覆盖与启动前核对
 
 默认 YAML 使用项目相对路径。解析优先级为 **显式路径 CLI → 环境变量 → YAML → 同级目录默认值**。所有相对文件路径以 OpenVLA 项目根目录为基准；Python 可执行文件保留 `.venv/bin/python` 路径，不解析 symlink 到其基础解释器。
 
@@ -87,17 +106,17 @@ bash scripts/setup_csgo_seen10.sh --check
 | --- | --- | --- | --- |
 | Benchmark 数据 | `../UniLIP/data/csgo_benchmark_v2` | `CSGO_DATA_ROOT`，兼容 `DATA_ROOT` | `--data-root` |
 | 共享 evaluator | `../csgo_benchmark_v2_eval_general` | `SHARED_EVAL_DIR`，兼容 `CSGO_EVAL_ROOT` | `--eval-root` |
-| evaluator Python | `.venv/bin/python` | `UNILIP_PYTHON` | `--unilip-python` |
+| evaluator Python | `<shared_eval_dir>/.venv/bin/python` | `CSGO_EVAL_PYTHON`，兼容 `UNILIP_PYTHON` | `--eval-python`，兼容 `--unilip-python` |
 | 原始模型目录 | `checkpoints/openvla-7b` | `OPENVLA_MODEL_PATH`，下载工具也读取 | `--model-path` |
 
-旧 YAML 中原服务器的三个默认绝对路径在存在时沿用，不存在时迁移到同级数据/evaluator及本地 `.venv`；用户自定义的路径和显式覆盖不会被静默替换。两个数据变量同时存在时 `CSGO_DATA_ROOT` 优先；两个 evaluator 变量同时存在时 `SHARED_EVAL_DIR` 优先。清理不再使用的旧环境变量，避免覆盖 YAML。
+旧 YAML 中原服务器的数据/evaluator 默认绝对路径在存在时沿用，不存在时迁移到同级目录。两份当前 YAML 的 `unilip_python: null` 表示使用解析后的 evaluator 目录内 `.venv/bin/python`；修改 `SHARED_EVAL_DIR` 也会随之切换默认评测环境。Python 显式路径只按优先级选取，不检查其存在性，不回退；旧 YAML 若显式指定其他 Python 则仍视为用户覆盖。两个数据变量同时存在时 `CSGO_DATA_ROOT` 优先；两个 evaluator 变量同时存在时 `SHARED_EVAL_DIR` 优先。清理不再使用的旧环境变量，避免覆盖 YAML。
 
 布局不同时可在同一 shell 设置：
 
 ```bash
 export CSGO_DATA_ROOT=/home/user/yc57963/task/UniLIP/data/csgo_benchmark_v2
 export SHARED_EVAL_DIR=/home/user/yc57963/task/csgo_benchmark_v2_eval_general
-export UNILIP_PYTHON=/home/user/yc57963/task/openvla-oft/.venv/bin/python
+export CSGO_EVAL_PYTHON=/home/user/yc57963/task/csgo_benchmark_v2_eval_general/.venv/bin/python
 ```
 
 训练、推理、评测共用解析规则。只打印实际路径、不加载模型、不创建实验目录：
@@ -161,7 +180,7 @@ legacy 同样支持训练的 `--resume-checkpoint`，以及推理的 `--checkpoi
 正式 evaluator 要求完整 20,000 条 coverage。仅重评已有 legacy 预测时，可直接调用共享入口，写入未使用的目录：
 
 ```bash
-./.venv/bin/python \
+../csgo_benchmark_v2_eval_general/.venv/bin/python \
   ../csgo_benchmark_v2_eval_general/run_eval.py localization \
   --pred-root outputs/csgo_benchmark_v2_seen10/OpenVLA-OFT/seed_0/localization \
   --data-root ../UniLIP/data/csgo_benchmark_v2 \

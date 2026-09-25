@@ -17,7 +17,6 @@ DEFAULT_OUTPUT_ROOT = "outputs/csgo_benchmark_v2_seen10"
 LEGACY_DEFAULTS = {
     "data_root": "/home/jiahao/task/UniLIP/data/csgo_benchmark_v2",
     "shared_eval_dir": "/home/jiahao/task/csgo_benchmark_v2_eval_general",
-    "unilip_python": "/home/jiahao/miniconda3/envs/UniLIP/bin/python",
 }
 
 
@@ -61,8 +60,18 @@ def evaluator_root(config: Mapping[str, Any], *, root: Path = PROJECT_ROOT,
 
 def evaluator_python(config: Mapping[str, Any], *, root: Path = PROJECT_ROOT,
                      env: Mapping[str, str] | None = None) -> Path:
-    return _resolve(config, "unilip_python", ".venv/bin/python", ("UNILIP_PYTHON",),
-                    root=root, env=os.environ if env is None else env)
+    # Selection only: do not probe/install the environment or fall back to a
+    # model project's Python. subprocess.call reports a missing executable.
+    environment = os.environ if env is None else env
+    explicit = config.get("_path_overrides", {}).get("unilip_python")
+    if explicit is not None:
+        return project_path(explicit, root=root)
+    for name in ("CSGO_EVAL_PYTHON", "UNILIP_PYTHON"):
+        if environment.get(name):
+            return project_path(environment[name], root=root)
+    if config.get("unilip_python"):
+        return project_path(config["unilip_python"], root=root)
+    return evaluator_root(config, root=root, env=environment) / ".venv/bin/python"
 
 
 def model_path(config: Mapping[str, Any], *, root: Path = PROJECT_ROOT,

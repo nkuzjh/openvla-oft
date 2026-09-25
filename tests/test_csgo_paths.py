@@ -21,7 +21,8 @@ class PortablePathsTest(unittest.TestCase):
                          root.parent / "UniLIP/data/csgo_benchmark_v2")
         self.assertEqual(paths.evaluator_root({}, root=root, env={}).resolve(),
                          root.parent / "csgo_benchmark_v2_eval_general")
-        self.assertEqual(paths.evaluator_python({}, root=root, env={}), root / ".venv/bin/python")
+        self.assertEqual(paths.evaluator_python({}, root=root, env={}),
+                         root / "../csgo_benchmark_v2_eval_general/.venv/bin/python")
         self.assertEqual(paths.model_path({}, root=root, env={}), str(root / "checkpoints/openvla-7b"))
         config = {"data_root": "yaml-data", "_path_overrides": {"data_root": "cli-data"}}
         env = {"CSGO_DATA_ROOT": "env-data", "DATA_ROOT": "old-alias"}
@@ -37,10 +38,9 @@ class PortablePathsTest(unittest.TestCase):
         with patch.object(Path, "exists", return_value=False):
             self.assertEqual(paths.data_root(config, root=root, env={}).resolve(),
                              root.parent / "UniLIP/data/csgo_benchmark_v2")
-            self.assertEqual(paths.evaluator_python(config, root=root, env={}), root / ".venv/bin/python")
         with patch.object(Path, "exists", return_value=True):
-            self.assertEqual(paths.evaluator_python(config, root=root, env={}),
-                             Path(paths.LEGACY_DEFAULTS["unilip_python"]))
+            self.assertEqual(paths.data_root(config, root=root, env={}),
+                             Path(paths.LEGACY_DEFAULTS["data_root"]))
         config["data_root"] = "/custom/missing-data"
         self.assertEqual(paths.data_root(config, root=root, env={}), Path("/custom/missing-data"))
         self.assertEqual(paths.data_root({}, root=root, env={"DATA_ROOT": paths.LEGACY_DEFAULTS["data_root"]}),
@@ -52,8 +52,20 @@ class PortablePathsTest(unittest.TestCase):
             executable = root / ".venv/bin/python"
             executable.parent.mkdir(parents=True)
             executable.symlink_to(sys.executable)
-            self.assertEqual(paths.evaluator_python({}, root=root, env={}), executable)
+            self.assertEqual(paths.evaluator_python({"shared_eval_dir": str(root)}, root=root, env={}), executable)
             self.assertNotEqual(executable, executable.resolve())
+
+    def test_evaluator_python_selection_has_no_validation_or_fallback(self):
+        root = Path("/new/task/openvla-oft")
+        with patch.object(Path, "exists", side_effect=AssertionError("No environment probe allowed")):
+            self.assertEqual(paths.evaluator_python({"shared_eval_dir": "/shared/eval"}, root=root, env={}),
+                             Path("/shared/eval/.venv/bin/python"))
+            self.assertEqual(paths.evaluator_python({"unilip_python": "/missing/python"}, root=root, env={}),
+                             Path("/missing/python"))
+            env = {"CSGO_EVAL_PYTHON": "/unified/python", "UNILIP_PYTHON": "/legacy/python"}
+            self.assertEqual(paths.evaluator_python({}, root=root, env=env), Path("/unified/python"))
+            config = {"_path_overrides": {"unilip_python": "/cli/python"}}
+            self.assertEqual(paths.evaluator_python(config, root=root, env=env), Path("/cli/python"))
 
     def test_all_entrypoints_print_paths_without_model_imports(self):
         import builtins
@@ -79,7 +91,8 @@ class PortablePathsTest(unittest.TestCase):
                     report = json.loads(output.getvalue())
                     self.assertEqual(report["execution"], "paths_only")
                     self.assertEqual(report["data_root"], "/custom/data")
-                    self.assertEqual(report["evaluator_python"], str(paths.PROJECT_ROOT / ".venv/bin/python"))
+                    self.assertEqual(report["evaluator_python"],
+                                     str(paths.PROJECT_ROOT / "../csgo_benchmark_v2_eval_general/.venv/bin/python"))
                     self.assertTrue(report["run_dir"].endswith("OpenVLA-OFT/seed_42"))
                 self.assertEqual(list(Path(directory).iterdir()), [])
         finally:

@@ -30,7 +30,8 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--data-root", help="Benchmark data directory; overrides environment/YAML")
     parser.add_argument("--eval-root", help="Shared evaluator directory")
-    parser.add_argument("--unilip-python", help="Evaluator Python (default: project .venv/bin/python)")
+    parser.add_argument("--eval-python", "--unilip-python", dest="unilip_python",
+                        help="Evaluator Python (default: <shared_eval_dir>/.venv/bin/python)")
     parser.add_argument("--model-path", help="Original OpenVLA base directory")
     parser.add_argument("--print-paths", action="store_true",
                         help="Print resolved paths without loading models or running any phase")
