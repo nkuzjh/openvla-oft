@@ -90,7 +90,7 @@ bash setup_env.sh
 cd /home/user/yc57963/task/openvla-oft
 ```
 
-安装入口及固定依赖见 [评测器 README](../csgo_benchmark_v2_eval_general/README.md)。 默认安装命令也逐项准备生成评测权重：优先复用 UniLIP 缓存，缺失时下载至评测器 `loaded_models`。仅部署定位评测可用 `bash setup_env.sh --skip-weights`；定位训练/评测本身不需要这些生成指标权重。默认 CPU PyTorch 环境满足定位评测，避免不同模型项目的包版本影响评测；生成任务如需 GPU 可按该 README 显式选择 CUDA 后端。环境和评测器代码由用户自行部署；OpenVLA eval 不检查、不安装、不修复统一环境，也不会回退到模型环境，解释器未安装时直接由进程启动报错。
+安装入口及固定依赖见 [评测器 README](../csgo_benchmark_v2_eval_general/README.md)。 默认安装命令也逐项准备生成评测权重：按用户 Torch 缓存（默认 `~/.cache/torch/hub/checkpoints`）→ UniLIP `loaded_models` → 评测器 `loaded_models` 查找，均无有效副本时才下载至评测器 `loaded_models`。仅部署定位评测可用 `bash setup_env.sh --skip-weights`；定位训练/评测本身不需要这些生成指标权重。默认 CPU PyTorch 环境满足定位评测，避免不同模型项目的包版本影响评测；生成任务如需 GPU 可按该 README 显式选择 CUDA 后端。环境和评测器代码由用户自行部署；OpenVLA eval 不检查、不安装、不修复统一环境，也不会回退到模型环境，解释器未安装时直接由进程启动报错。
 
 若此前设置过指向 OpenVLA/UniLIP 的解释器环境变量，先取消覆盖以使用统一默认：
 
