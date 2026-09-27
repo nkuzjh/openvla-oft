@@ -52,7 +52,7 @@ num_steps_before_decay: 100000
 scheduler_gamma: 0.1
 max_steps: 19500
 # Includes a final event even though 19500 is not divisible by 4000.
-event_every: 4000
+event_every: 1000
 checkpoint_selection: late
 validation_selection_metric: external_normalized_l1
 
