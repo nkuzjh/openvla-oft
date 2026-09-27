@@ -339,7 +339,7 @@ def _validate_aligned_config(config: Mapping[str, Any]) -> None:
         "sampler_policy": "global_full_update_batches", "effective_batch_size": 128,
         "learning_rate": 5e-4, "weight_decay": 0.01, "adam_betas": [0.9, 0.999],
         "adam_eps": 1e-8, "lr_warmup_steps": 0, "scheduler_gamma": 0.1,
-        "num_steps_before_decay": 100000, "max_steps": 19500, "event_every": 4000,
+        "num_steps_before_decay": 100000, "max_steps": 19500, "event_every":1000,
         "checkpoint_selection": "late", "validation_selection_metric": "external_normalized_l1",
         "action_dim": 5, "action_horizon": 1, "use_proprio": False, "use_l1_regression": True,
     }
