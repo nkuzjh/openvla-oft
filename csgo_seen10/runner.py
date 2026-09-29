@@ -832,6 +832,13 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
 
     _validate_aligned_config(config)
     ctx = init_distributed()
+    startup_time = time.monotonic()
+
+    def startup_log(message: str) -> None:
+        if ctx.is_main:
+            print(f"[startup] {message} elapsed={time.monotonic() - startup_time:.1f}s", flush=True)
+
+    startup_log("checking configuration and checkpoint identity")
     _set_seed(seed, ctx.rank)
     maps = _selected_maps(config)
     if not smoke and maps != SEEN10_MAPS:
@@ -915,7 +922,9 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
             raise ValueError(f"Resume dataset/model identity differs from checkpoint: {identity_mismatches}")
 
     model_path = _model_path(config)
+    startup_log("loading normalization")
     normalization = _prepare_normalization(config, data_root, maps, resume_dir, fitting=True)
+    startup_log("loading base model, LoRA adapter and action head")
     bundle = create_model(
         model_path,
         device=ctx.device,
@@ -924,6 +933,7 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
     )
     bundle = _wrap_ddp(bundle, ctx)
 
+    startup_log("model ready; reading seen_train metadata")
     train_dataset = _records_for_split(
         data_root,
         "seen_train",
@@ -932,6 +942,7 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         smoke=smoke,
         samples_per_map=int(_config_value(config, "smoke_samples_per_map", 10)),
     )
+    startup_log("reading seen_validation metadata")
     val_dataset = _records_for_split(
         data_root,
         "seen_validation",
@@ -980,7 +991,11 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
             f"train loader has {len(train_loader)} batches but grad_accumulation_steps={grad_accum}; "
             "increase the selected dataset or lower accumulation"
         )
+    # Resume changes the aligned sampler's remaining length. Checkpoint offsets
+    # and epoch transitions always refer to the original full epoch length.
+    full_epoch_batches = len(train_loader)
 
+    startup_log("datasets ready; constructing optimizer and scheduler")
     trainable_parameters = _trainable_parameters(bundle)
     optimizer = AdamW(trainable_parameters, lr=learning_rate,
                       weight_decay=float(_config_value(config, "weight_decay", 0.01)),
@@ -994,6 +1009,7 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
     next_batch = 0
     best_val_loss = math.inf
     if resume_dir is not None:
+        startup_log(f"restoring optimizer, scheduler and RNG from {resume_dir}")
         state = _restore_optimizer_scheduler(resume_dir, optimizer, scheduler, device=ctx.device)
         start_step = int(state["step"])
         position = state.get("data_position", {})
@@ -1001,7 +1017,9 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         next_batch = int(position.get("next_batch", 0))
         best_val_loss = float(state.get("best_val_loss", math.inf))
         _restore_rng_state(resume_dir, ctx.rank, ctx.device)
+        startup_log(f"restored step={start_step}, epoch={epoch}, next_batch={next_batch}")
 
+    startup_log("computing provenance hashes and writing run metadata")
     provenance = _provenance_for_run(
         bundle=bundle,
         data_root=data_root,
@@ -1052,6 +1070,7 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         loss_log.parent.mkdir(parents=True, exist_ok=True)
     ctx.barrier()
     global_step = start_step
+    startup_log(f"ready: optimizer_step={global_step}/{max_steps}, full_epoch_batches={full_epoch_batches}")
     if global_step >= max_steps:
         if ctx.is_main:
             _plot_loss(loss_log, run_dir / "logs" / "main_loss.png")
@@ -1069,13 +1088,26 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         update_loss_sum = 0.0
         update_sample_count = 0
         epoch_start_batch = next_batch
-        if epoch_start_batch >= len(train_loader):
+        if epoch_start_batch >= full_epoch_batches:
             epoch += 1
             next_batch = 0
             continue
-        for batch_index, batch in enumerate(train_loader):
+        first_batch_index = 0
+        if isinstance(train_sampler, GlobalUpdateSampler):
+            train_sampler.set_start_batch(epoch_start_batch)
+            first_batch_index = epoch_start_batch
+        if ctx.is_main and global_step == start_step:
+            mode = "skip indices before image loading" if isinstance(train_sampler, GlobalUpdateSampler) else "legacy batch replay"
+            print(
+                f"[train] epoch={epoch} next_batch={epoch_start_batch}/{full_epoch_batches}; "
+                f"{mode}; waiting for first active batch",
+                flush=True,
+            )
+        for batch_index, batch in enumerate(train_loader, start=first_batch_index):
             if batch_index < epoch_start_batch:
                 continue
+            if ctx.is_main and global_step == start_step and batch_index == epoch_start_batch:
+                print(f"[train] first active batch ready; starting forward/backward at step={global_step}", flush=True)
             progressed_any = True
             bundle.vla.train()
             bundle.action_head.train()
@@ -1106,7 +1138,7 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
             update_loss_sum, update_sample_count = 0.0, 0
             next_batch = batch_index + 1
             next_epoch = epoch
-            if next_batch >= len(train_loader):
+            if next_batch >= full_epoch_batches:
                 next_epoch, next_batch = epoch + 1, 0
             if ctx.is_main:
                 _jsonl_append(
@@ -1122,7 +1154,7 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
                         "elapsed_seconds": float(time.time() - start_time),
                     },
                 )
-                if global_step <= 2 or global_step % 50 == 0:
+                if global_step <= 2 or global_step == start_step + 1 or global_step % 50 == 0:
                     print(
                         f"[train] optimizer_step={global_step}/{max_steps} "
                         f"loss={update_loss:.6f} grad_norm={probe_grad_norm:.6g} "

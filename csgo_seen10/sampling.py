@@ -29,6 +29,9 @@ class GlobalUpdateSampler(Sampler):
         self.effective_batch_size = int(effective_batch_size)
         self.rank, self.world_size = int(rank), int(world_size)
         self.seed, self.epoch = int(seed), 0
+        self.microbatch_size = int(microbatch_size)
+        self.accumulation_steps = int(accumulation_steps)
+        self.start_batch = 0
         if min(self.effective_batch_size, microbatch_size, accumulation_steps, self.world_size) <= 0:
             raise ValueError("Batch, accumulation and world size must be positive")
         if not 0 <= self.rank < self.world_size:
@@ -46,6 +49,21 @@ class GlobalUpdateSampler(Sampler):
         if epoch < 0:
             raise ValueError("epoch must be nonnegative")
         self.epoch = int(epoch)
+        self.start_batch = 0
+
+    def set_start_batch(self, batch: int) -> None:
+        """Skip completed updates before dataset access, preserving epoch order.
+
+        Checkpoints store a per-rank microbatch offset into the *full* epoch.
+        Augmentation is keyed by epoch/sample rather than iterator consumption.
+        """
+        full_batches = self.used_per_epoch // self.world_size // self.microbatch_size
+        if batch < 0 or batch > full_batches or batch % self.accumulation_steps:
+            raise ValueError(
+                f"Resume batch {batch} must be an update boundary in [0, {full_batches}] "
+                f"(accumulation={self.accumulation_steps})"
+            )
+        self.start_batch = int(batch)
 
     def global_indices(self) -> torch.Tensor:
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
@@ -61,7 +79,7 @@ class GlobalUpdateSampler(Sampler):
         batches = self.global_indices().reshape(-1, self.effective_batch_size)
         start = self.rank * self.local_update_size
         local = batches[:, start:start + self.local_update_size].reshape(-1).tolist()
-        return iter((index, self.epoch) for index in local)
+        return iter((index, self.epoch) for index in local[self.start_batch * self.microbatch_size:])
 
     def __len__(self):
-        return self.used_per_epoch // self.world_size
+        return self.used_per_epoch // self.world_size - self.start_batch * self.microbatch_size
