@@ -146,7 +146,7 @@ bash scripts/run_csgo_seen10.sh eval --config configs/csgo_seen10_aligned_v2.yam
 CLI 的兼容默认 seed 仍是 0，不能省略 aligned 命令中的 `--seed 42`。训练断点恢复：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 nohup ./.venv/bin/python train_seen10.py --config configs/csgo_seen10_aligned_v2.yaml --seed 42 --resume-checkpoint outputs/csgo_benchmark_v2_seen10_aligned_v2/OpenVLA-OFT/seed_42/checkpoints/late >>openvla_aligned_v2.nohup.out2 2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup ./.venv/bin/python train_seen10.py --config configs/csgo_seen10_aligned_v2.yaml --seed 42 --resume-checkpoint outputs/csgo_benchmark_v2_seen10_aligned_v2/OpenVLA-OFT/seed_42/checkpoints/late >>openvla_aligned_v2.nohup.out2 2>&1 &
 ```
 
 恢复要求相同的 recipe、数据身份、base/stats、world size、microbatch 和累计步数。新运行若使用多 GPU，须在单独配置中调整累计步数，使 `GPU 数 × 每卡 batch × accumulation = 128`；不支持断点恢复时切换拓扑。wrapper `scripts/run_csgo_seen10.sh train` 使用 `torchrun`，进程数来自 `NPROC_PER_NODE`，默认 1。
