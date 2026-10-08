@@ -38,7 +38,7 @@ PY
 
 `main_loss.jsonl` 每个 optimizer update 都写；stdout 旧代码仅前两步及每50步打印。检查最新 loss step 是否已超过 checkpoint step，可区分“没有推进”和“stdout 尚未到打印间隔”。
 
-同步修复的 `csgo_seen10/sampling.py` 与 `csgo_seen10/runner.py` 后，已在运行的 Python 进程不会自动采用新代码。由用户确认原进程状态并决定停止/重启，不能向同一 run 目录并发启动第二个训练进程。保持原 checkpoint 对应的 world size、batch、累计和实验配置；单卡原运行可以直接用 `python train_seen10.py` 恢复。
+同步修复的 `csgo_seen10/sampling.py` 与 `csgo_seen10/runner.py` 后，已在运行的 Python 进程不会自动采用新代码。由用户确认原进程状态并决定停止/重启，不能向同一 run 目录并发启动第二个训练进程。单卡原运行保持 checkpoint 对应的 world size、batch、累计和实验配置，可以直接用 `python train_seen10.py` 恢复。2026-10-09 已另行实现 aligned 单卡→多卡恢复，需同时同步新增的 `csgo_seen10/resume.py`；此时使用 torchrun、保持有效batch相同，详见[扩卡恢复方案](CSGO_SEEN10_MULTI_GPU_RESUME.md)。
 
 原 resume 命令保持兼容，后续手动重启可为 Python 增加 `-u`。这是及时输出日志的选项，不是索引跳过修复的替代品。启动日志依次报告：
 

@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 from .data import SEEN10_MAPS, CSGOSeen10Dataset
 from .action_normalization import ActionNormalization, fit_seen_train_stats
 from .sampling import GlobalUpdateSampler, event_steps
+from .resume import remap_resume_position, validate_resume_settings
 from . import paths
 from .cli import build_arg_parser, load_config
 from .model import (
@@ -465,6 +466,7 @@ def _save_rng_state(checkpoint_dir: Path, rank: int) -> None:
     }
     if torch.cuda.is_available():
         payload["cuda"] = torch.cuda.get_rng_state_all()
+        payload["cuda_device_index"] = torch.cuda.current_device()
     torch.save(payload, checkpoint_dir / f"rng_state_rank_{rank}.pt")
 
 
@@ -480,6 +482,33 @@ def _restore_rng_state(checkpoint_dir: Path, rank: int, device: torch.device) ->
     random.setstate(payload["python"])
     if torch.cuda.is_available() and "cuda" in payload:
         torch.cuda.set_rng_state_all(payload["cuda"])
+    return True
+
+
+def _restore_single_rank_rng_state(checkpoint_dir: Path, device: torch.device) -> bool:
+    """Copy the saved rank-zero stream to one new rank's active device."""
+
+    path = checkpoint_dir / "rng_state_rank_0.pt"
+    if not path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint is missing rank-zero RNG state: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if device.type == "cuda":
+        cuda_states = payload.get("cuda")
+        if not isinstance(cuda_states, (list, tuple)) or not cuda_states:
+            raise ValueError(f"Resume checkpoint has no CUDA RNG state for expansion: {path}")
+        source_index = payload.get("cuda_device_index", 0)
+        if type(source_index) is not int or not 0 <= source_index < len(cuda_states):
+            raise ValueError(
+                f"Resume CUDA RNG device index {source_index!r} is outside "
+                f"the saved state list of length {len(cuda_states)}: {path}"
+            )
+        if not isinstance(cuda_states[source_index], torch.Tensor) or not cuda_states[source_index].numel():
+            raise ValueError(f"Resume checkpoint has invalid active CUDA RNG state: {path}")
+    torch.set_rng_state(payload["torch"])
+    np.random.set_state(payload["numpy"])
+    random.setstate(payload["python"])
+    if device.type == "cuda":
+        torch.cuda.set_rng_state(cuda_states[source_index], device=device)
     return True
 
 
@@ -890,6 +919,8 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         "event_every": int(event_every),
         "smoke": bool(smoke),
     }
+    topology_expansion = False
+    position_remap: dict[str, Any] | None = None
     if resume_dir is not None:
         saved_settings = resume_state_hint.get("training_settings")
         saved_provenance = resume_state_hint.get("provenance")
@@ -901,13 +932,10 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
             raise ValueError(
                 "Resume checkpoint has no training_settings; refusing a potentially different sampler setup"
             )
-        mismatches = {
-            key: (saved_settings.get(key), value)
-            for key, value in training_settings.items()
-            if saved_settings.get(key) != value
-        }
-        if mismatches:
-            raise ValueError(f"Resume training settings differ from checkpoint: {mismatches}")
+        topology_expansion = validate_resume_settings(
+            saved_settings, training_settings,
+            sampler_policy=str(_config_value(config, "sampler_policy", "legacy")),
+        )
         saved_identity = saved_provenance.get("resume_identity")
         if not isinstance(saved_identity, Mapping):
             raise ValueError("Resume checkpoint has no resume_identity; refusing a different dataset/model recipe")
@@ -920,6 +948,16 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         }
         if identity_mismatches:
             raise ValueError(f"Resume dataset/model identity differs from checkpoint: {identity_mismatches}")
+        if topology_expansion and not _is_aligned(config):
+            raise ValueError("Single-rank checkpoint expansion requires the aligned recipe")
+        if topology_expansion:
+            startup_log(
+                "validated topology expansion: "
+                f"world_size 1->{ctx.world_size}, "
+                f"microbatch/accumulation {saved_settings['batch_size']}/"
+                f"{saved_settings['grad_accumulation_steps']}->{batch_size}/{grad_accum}, "
+                f"effective_batch={batch_size * grad_accum * ctx.world_size}"
+            )
 
     model_path = _model_path(config)
     startup_log("loading normalization")
@@ -942,6 +980,17 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         smoke=smoke,
         samples_per_map=int(_config_value(config, "smoke_samples_per_map", 10)),
     )
+    if topology_expansion:
+        position_remap = remap_resume_position(
+            resume_state_hint, saved_settings, training_settings,
+            dataset_size=len(train_dataset),
+        )
+        startup_log(
+            "mapped resume position: "
+            f"old={position_remap['old_position']} -> new={position_remap['new_position']}, "
+            f"step={position_remap['global_step']}, "
+            f"updates_per_epoch={position_remap['updates_per_epoch']}"
+        )
     startup_log("reading seen_validation metadata")
     val_dataset = _records_for_split(
         data_root,
@@ -1012,11 +1061,21 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
         startup_log(f"restoring optimizer, scheduler and RNG from {resume_dir}")
         state = _restore_optimizer_scheduler(resume_dir, optimizer, scheduler, device=ctx.device)
         start_step = int(state["step"])
-        position = state.get("data_position", {})
+        position = position_remap["new_position"] if position_remap is not None else state.get("data_position", {})
         epoch = int(position.get("epoch", 0))
         next_batch = int(position.get("next_batch", 0))
         best_val_loss = float(state.get("best_val_loss", math.inf))
-        _restore_rng_state(resume_dir, ctx.rank, ctx.device)
+        if topology_expansion:
+            _restore_single_rank_rng_state(resume_dir, ctx.device)
+            startup_log(
+                "copied rank-zero Python, NumPy and CPU Torch RNG; "
+                + (
+                    f"copied saved active CUDA RNG to device={ctx.device}"
+                    if ctx.device.type == "cuda" else "CPU training device"
+                )
+            )
+        else:
+            _restore_rng_state(resume_dir, ctx.rank, ctx.device)
         startup_log(f"restored step={start_step}, epoch={epoch}, next_batch={next_batch}")
 
     startup_log("computing provenance hashes and writing run metadata")
@@ -1031,6 +1090,32 @@ def train(config: Mapping[str, Any], *, seed: int, resume_checkpoint: str | None
     )
     provenance["resume_identity"] = resume_identity
     provenance["training_settings"] = training_settings
+    if resume_dir is not None:
+        inherited_history = saved_provenance.get("resume_transition_history")
+        if inherited_history is not None:
+            if not isinstance(inherited_history, list):
+                raise ValueError("Resume checkpoint has invalid resume_transition_history")
+            transition_history = list(inherited_history)
+        elif isinstance(saved_provenance.get("resume_transition"), Mapping):
+            transition_history = [dict(saved_provenance["resume_transition"])]
+        else:
+            transition_history = []
+        if topology_expansion:
+            transition = {
+                "from_training_settings": dict(saved_settings),
+                "to_training_settings": dict(training_settings),
+                "old_position": position_remap["old_position"],
+                "new_position": position_remap["new_position"],
+                "global_step": int(start_step),
+                "effective_batch_size": position_remap["effective_batch_size"],
+                "rng_strategy": "copy_rank_zero_cpu_and_saved_active_cuda_device_to_each_rank",
+            }
+            transition_history.append(transition)
+            provenance["resume_transition"] = transition
+        elif transition_history:
+            provenance["resume_transition"] = transition_history[-1]
+        if transition_history:
+            provenance["resume_transition_history"] = transition_history
     if ctx.is_main:
         _json_dump(run_dir / "run_provenance.json", provenance)
         if _is_aligned(config):

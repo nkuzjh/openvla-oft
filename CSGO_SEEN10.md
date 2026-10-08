@@ -149,7 +149,15 @@ CLI 的兼容默认 seed 仍是 0，不能省略 aligned 命令中的 `--seed 42
 CUDA_VISIBLE_DEVICES=1 nohup ./.venv/bin/python train_seen10.py --config configs/csgo_seen10_aligned_v2.yaml --seed 42 --resume-checkpoint outputs/csgo_benchmark_v2_seen10_aligned_v2/OpenVLA-OFT/seed_42/checkpoints/late >>openvla_aligned_v2.nohup.out2 2>&1 &
 ```
 
-恢复要求相同的 recipe、数据身份、base/stats、world size、microbatch 和累计步数。新运行若使用多 GPU，须在单独配置中调整累计步数，使 `GPU 数 × 每卡 batch × accumulation = 128`；不支持断点恢复时切换拓扑。wrapper `scripts/run_csgo_seen10.sh train` 使用 `torchrun`，进程数来自 `NPROC_PER_NODE`，默认 1。
+恢复要求相同的 recipe、数据身份和 base/stats。单卡→单卡，以及已有多卡 checkpoint 按相同卡数恢复，仍要求 world size、microbatch、累计步数分别一致。当前 aligned 新增单卡 checkpoint→双卡/多卡恢复：用户修改 microbatch、累计次数和启动进程数，只要新旧实际有效 batch 相等（本配方为128），代码自动换算恢复位置并将旧 rank 0 的完整 RNG 状态复制到每个 rank 的训练设备。不同有效 batch 直接报错；legacy、双卡→单卡、已有多卡→不同卡数恢复未放宽。wrapper `scripts/run_csgo_seen10.sh train` 使用 `torchrun`，进程数来自 `NPROC_PER_NODE`，默认1；仅设置 `CUDA_VISIBLE_DEVICES=0,1` 不会启动两个训练进程。
+
+例如，复制本配置到 `configs/csgo_seen10_aligned_v2_2gpu.yaml`，手动设置 `batch_size: 32`、`grad_accumulation_steps: 2`，保持 `effective_batch_size: 128` 和原 seed/output_root 等实验字段，再手动执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2 NPROC_PER_NODE=2 PYTHONUNBUFFERED=1 nohup bash scripts/run_csgo_seen10.sh train --config configs/csgo_seen10_aligned_v2_2gpu.yaml --seed 42 --resume-checkpoint outputs/csgo_benchmark_v2_seen10_aligned_v2/OpenVLA-OFT/seed_42/checkpoints/late >>openvla_aligned_v2.resume_2gpu.out 2>&1 &
+```
+
+上述2GPU配置文件由用户复制和编辑，本次未创建或修改实验配置。使用前确认原进程已停止，同一输出目录只运行一个训练任务。新增功能保留 optimizer/scheduler/global step；详细转换规则、RNG兼容和测试边界见 [单卡扩卡恢复完整方案](CSGO_SEEN10_MULTI_GPU_RESUME.md)。
 
 aligned 测试推理固定单进程、batch 1、相同 seed 42、一次连续回归前向，无随机增强或额外预测 clip。默认取 `late`。中断后只补缺失 ID：
 

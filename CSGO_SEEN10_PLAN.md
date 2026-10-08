@@ -173,12 +173,15 @@ aligned 由 `recipe_id` 分派，`_validate_aligned_config` 对批准的固定�
 | [action_normalization.py](csgo_seen10/action_normalization.py)：ActionNormalization | none / bounds_q99、完整 train 拟合、统计身份、target clip / inverse |
 | [augmentations.py](csgo_seen10/augmentations.py)：augment_image | none / oft_photometric_only，FPV/radar 独立可重复随机流 |
 | [sampling.py](csgo_seen10/sampling.py)：GlobalUpdateSampler / event_steps | 全局完整更新批次、rank 划分、epoch/恢复、强制 final |
+| [resume.py](csgo_seen10/resume.py)：validate_resume_settings / remap_resume_position | aligned单卡checkpoint扩卡时的有效batch校验、更新位置换算；其他情况严格恢复 |
 | [runner.py](csgo_seen10/runner.py)：train / save_checkpoint / inference / eval_command | 配置、实际参数组、预算、验证、保存恢复、推理 provenance、原 evaluator |
 | [scripts/check_csgo_aligned.py](scripts/check_csgo_aligned.py)、[tests](tests) | CPU 契约/采样/变换检查，独立有限 GPU 更新与组件重载 |
 | [train_seen10.py](train_seen10.py)、[infer_seen10.py](infer_seen10.py)、[eval_seen10.py](eval_seen10.py) | 兼容命令入口；参数和路径用法见运行说明 |
 | [scripts/run_csgo_seen10.sh](scripts/run_csgo_seen10.sh) | train/infer 的 torchrun 包装；smoke 会实际串联三个阶段 |
 
 训练/推理/评测支持 `--print-paths`，此分支不导入模型、不执行阶段任务；它不是完整配置或权重验收。入口仍没有 `--dry-run`、`--output-root` 或 `RUN_FULL` 防执行开关。环境与下载脚本的 `--dry-run` 是各自独立功能，不能照搬到训练命令。
+
+2026-10-09 新增 aligned 单卡 checkpoint→多卡恢复：新旧 GPU 数×microbatch×累计次数必须一致；按每 epoch 已完成的 optimizer updates 自动映射 `next_batch`，校验其与全局 step 一致。新增 rank 复制旧 rank 0 的 Python/NumPy/Torch CPU 和原 active CUDA RNG 状态；CUDA状态写入当前rank实际设备。原单卡恢复继续使用严格校验和原 RNG 恢复函数；已有多卡保存后可按新配置严格续训。迁移信息保存在 provenance 的 `resume_transition` / `resume_transition_history`，跨路径身份检查不放宽。完整算法、手动命令、验收与非逐位等价边界见 [CSGO_SEEN10_MULTI_GPU_RESUME.md](CSGO_SEEN10_MULTI_GPU_RESUME.md)。
 
 ### 7.3 跨服务器路径适配（2026-09-24）
 
