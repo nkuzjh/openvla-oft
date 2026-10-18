@@ -154,7 +154,7 @@ CUDA_VISIBLE_DEVICES=1 nohup ./.venv/bin/python train_seen10.py --config configs
 例如，复制本配置到 `configs/csgo_seen10_aligned_v2_2gpu.yaml`，手动设置 `batch_size: 32`、`grad_accumulation_steps: 2`，保持 `effective_batch_size: 128` 和原 seed/output_root 等实验字段，再手动执行：
 
 ```bash
-CUDA_VISIBLE_DEVICES=1,2 NPROC_PER_NODE=2 PYTHONUNBUFFERED=1 nohup bash scripts/run_csgo_seen10.sh train --config configs/csgo_seen10_aligned_v2_2gpu.yaml --seed 42 --resume-checkpoint outputs/csgo_benchmark_v2_seen10_aligned_v2/OpenVLA-OFT/seed_42/checkpoints/late >>openvla_aligned_v2.resume_2gpu.out 2>&1 &
+CUDA_VISIBLE_DEVICES=2,3 NPROC_PER_NODE=2 PYTHONUNBUFFERED=1 nohup bash scripts/run_csgo_seen10.sh train --config configs/csgo_seen10_aligned_v2_2gpu.yaml --seed 42 --resume-checkpoint outputs/csgo_benchmark_v2_seen10_aligned_v2/OpenVLA-OFT/seed_42/checkpoints/late >>openvla_aligned_v2.resume_2gpu.out 2>&1 &
 ```
 
 上述2GPU配置文件由用户复制和编辑，本次未创建或修改实验配置。使用前确认原进程已停止，同一输出目录只运行一个训练任务。新增功能保留 optimizer/scheduler/global step；详细转换规则、RNG兼容和测试边界见 [单卡扩卡恢复完整方案](CSGO_SEEN10_MULTI_GPU_RESUME.md)。
