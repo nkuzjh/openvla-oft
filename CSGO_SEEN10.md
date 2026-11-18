@@ -2,7 +2,7 @@
 
 本文是 Seen-10 定位任务的运行说明，记录环境、命令、输出和当前结果。实验设计、实现边界、横向比较与验收证据统一维护在 [CSGO_SEEN10_PLAN.md](CSGO_SEEN10_PLAN.md)。两份文档同时覆盖首次接入的 legacy 和当前已实现的 aligned v2；正式训练、全量推理及评测由使用者手动启动。
 
-记录更新：2026-09-25。通用评测改为使用评测器项目自己的统一环境；本次安装独立评测环境并检查依赖/路径，不运行训练、推理或正式评测。
+记录更新：2026-11-13。第 4.2 节新增本机 `step_00010000` 的 Seen-10 全量定位推理与评测手动命令。其余历史状态描述截至 2026-09-25；本次只更新文档，未运行训练、推理或正式评测。
 
 ## 1. 实验范围与数据
 
@@ -168,7 +168,152 @@ aligned 测试推理固定单进程、batch 1、相同 seed 42、一次连续回
 
 推理会核对 checkpoint 和 provenance，不允许在同一预测目录混用不同模型。附加 best-val 结果可显式指定 `--checkpoint .../checkpoints/best`，但必须使用新的结果目录并明确标注。当前 CLI 没有 `--output-root`：复制 YAML 并修改 `output_root`，推理显式指定原 checkpoint，评测使用同一份新 YAML；不要覆盖 final 的预测。
 
-### 4.2 legacy：复现已有接入
+### 4.2 本机 step 10,000：Seen-10 全量定位推理与评测（手动执行）
+
+以下命令均在 `/home/jiahao/task/openvla-oft` 执行，使用 seed 42、单进程、`inference_batch_size: 1`，覆盖固定顺序的十张地图、每图 2,000 条测试数据，共 20,000 条。源权重是 `outputs/csgo_benchmark_v2_seen10_aligned_v2/OpenVLA-OFT/seed_42/checkpoints/step_00010000`，结果单独写入 `outputs/csgo_benchmark_v2_seen10_aligned_v2_step10000/OpenVLA-OFT/seed_42/`；它是训练中途的 step 10,000，不能标成 final 或 `late`。不要改 `max_steps`、`checkpoint_selection`、训练 batch/有效 batch、地图、Q99 统计或其他 recipe 字段。
+
+源 checkpoint 的 `training_state.json` 内 `provenance.resume_identity.model_request` 和 `data_root` 仍是旧服务器的绝对路径。当前推理按完整 `resume_identity` 严格比较，直接传源目录会报身份不匹配。先执行下面的准备命令：原 YAML 仅替换 `output_root`，其余文本（包括显式的推理 batch 1）原样复制；checkpoint 单独复制到新结果根，其中仅将两份元数据各自的 `resume_identity` 两个路径改成本机路径。`provenance.json` 的其他旧路径仍作为历史来源记录。权重和其他非 JSON 文件使用硬链接，全部 JSON 文件独立复制，因而写入副本元数据不会修改源文件；请勿原位修改硬链接的权重文件。若硬链接因跨文件系统不可用，则复制相应文件。准备命令拒绝已存在的目标根，失败时保留该根与报错以供检查，不要在同一目标上盲目重跑。
+
+```bash
+cd /home/jiahao/task/openvla-oft
+./.venv/bin/python - <<'PY'
+from pathlib import Path
+import copy
+import errno
+import hashlib
+import json
+import os
+import shutil
+
+project = Path('/home/jiahao/task/openvla-oft')
+source = project / 'outputs/csgo_benchmark_v2_seen10_aligned_v2/OpenVLA-OFT/seed_42/checkpoints/step_00010000'
+target_root = project / 'outputs/csgo_benchmark_v2_seen10_aligned_v2_step10000'
+run_dir = target_root / 'OpenVLA-OFT/seed_42'
+staged = run_dir / 'checkpoints/.step_00010000.prepare'
+target = run_dir / 'checkpoints/step_00010000'
+config_source = project / 'configs/csgo_seen10_aligned_v2.yaml'
+config_target = target_root / 'infer_step10000.yaml'
+model = project / 'checkpoints/openvla-7b'
+data = Path('/home/jiahao/task/UniLIP/data/csgo_benchmark_v2')
+old_model = '/home/user/yc57963/task/openvla-oft/checkpoints/openvla-7b'
+old_data = '/home/user/yc57963/task/UniLIP/data/csgo_benchmark_v2'
+
+assert source.is_dir() and (source / 'lora_adapter/adapter_config.json').is_file()
+assert (source / 'lora_adapter/adapter_model.safetensors').is_file()
+assert (source / 'action_head--10000_checkpoint.pt').is_file()
+assert not target_root.exists(), f'Target already exists: {target_root}'
+assert not any(path.is_symlink() for path in source.rglob('*'))
+original_config = config_source.read_text(encoding='utf-8')
+old_line = 'output_root: outputs/csgo_benchmark_v2_seen10_aligned_v2\n'
+assert original_config.count(old_line) == 1
+assert original_config.count('inference_batch_size: 1\n') == 1
+new_config = original_config.replace(old_line, 'output_root: outputs/csgo_benchmark_v2_seen10_aligned_v2_step10000\n')
+
+names = ('training_state.json', 'provenance.json')
+metadata = {name: json.loads((source / name).read_text(encoding='utf-8')) for name in names}
+assert metadata['training_state.json']['step'] == 10000
+identity = metadata['training_state.json']['provenance']['resume_identity']
+assert identity == metadata['provenance.json']['resume_identity']
+assert identity['model_request'] == old_model and identity['data_root'] == old_data
+assert identity['seed'] == 42 and identity['smoke'] is False and len(identity['maps']) == 10
+for filename, key in (('benchmark_manifest.json', 'benchmark_manifest_sha256'),
+                      ('minimal_dataset_report.json', 'minimal_dataset_report_sha256')):
+    assert hashlib.sha256((data / filename).read_bytes()).hexdigest() == identity[key], filename
+for filename in ('config.json', 'model.safetensors.index.json'):
+    assert hashlib.sha256((model / filename).read_bytes()).hexdigest() == identity['base_weight_sha256'][filename]
+
+def copy_file(src, dst):
+    if Path(src).suffix == '.json':
+        return shutil.copy2(src, dst)
+    try:
+        os.link(src, dst)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        return shutil.copy2(src, dst)
+    return dst
+
+target_root.mkdir(parents=True, exist_ok=False)
+try:
+    config_target.write_text(new_config, encoding='utf-8')
+    staged.parent.mkdir(parents=True)
+    shutil.copytree(source, staged, copy_function=copy_file)
+    for name in names:
+        destination = staged / name
+        assert not os.path.samefile(destination, source / name)
+        changed = copy.deepcopy(metadata[name])
+        local_identity = (changed['provenance']['resume_identity'] if name == 'training_state.json'
+                          else changed['resume_identity'])
+        local_identity['model_request'] = str(model.resolve())
+        local_identity['data_root'] = str(data.resolve())
+        destination.write_text(json.dumps(changed, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+        check = copy.deepcopy(changed)
+        check_identity = (check['provenance']['resume_identity'] if name == 'training_state.json'
+                          else check['resume_identity'])
+        check_identity['model_request'] = old_model
+        check_identity['data_root'] = old_data
+        assert check == metadata[name], name
+    staged.rename(target)
+except Exception:
+    print(f'Preparation failed; inspect and retain: {target_root}')
+    raise
+print(f'Config: {config_target}')
+print(f'Checkpoint: {target}')
+PY
+```
+
+预检只解析命令行和路径，不加载模型；确认输出中的 `run_dir` 是上面的独立目录，`checkpoint` 是适配副本：
+
+```bash
+./.venv/bin/python infer_seen10.py \
+  --config outputs/csgo_benchmark_v2_seen10_aligned_v2_step10000/infer_step10000.yaml \
+  --seed 42 --model-path /home/jiahao/task/openvla-oft/checkpoints/openvla-7b \
+  --data-root /home/jiahao/task/UniLIP/data/csgo_benchmark_v2 \
+  --eval-root /home/jiahao/task/csgo_benchmark_v2_eval_general \
+  --eval-python /home/jiahao/task/csgo_benchmark_v2_eval_general/.venv/bin/python \
+  --checkpoint outputs/csgo_benchmark_v2_seen10_aligned_v2_step10000/OpenVLA-OFT/seed_42/checkpoints/step_00010000 \
+  --print-paths
+```
+
+确认路径后，手动执行全量推理，然后用同一 YAML 评测同一预测目录。`CUDA_VISIBLE_DEVICES=0` 可改为目标 GPU；直接运行 Python 入口，保持单进程，不用 `torchrun`。推理仍会核对本机 base 权重完整 SHA256、benchmark/report 哈希、完整 recipe 与身份、checkpoint Q99 统计和 adapter/head；准备脚本仅提前核对小文件与路径字段。推理中断后在同一命令末尾追加 `--resume`，只补缺失 ID。
+
+```bash
+(
+set -e
+CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python infer_seen10.py \
+  --config outputs/csgo_benchmark_v2_seen10_aligned_v2_step10000/infer_step10000.yaml \
+  --seed 42 --model-path /home/jiahao/task/openvla-oft/checkpoints/openvla-7b \
+  --data-root /home/jiahao/task/UniLIP/data/csgo_benchmark_v2 \
+  --eval-root /home/jiahao/task/csgo_benchmark_v2_eval_general \
+  --eval-python /home/jiahao/task/csgo_benchmark_v2_eval_general/.venv/bin/python \
+  --checkpoint outputs/csgo_benchmark_v2_seen10_aligned_v2_step10000/OpenVLA-OFT/seed_42/checkpoints/step_00010000
+
+./.venv/bin/python eval_seen10.py \
+  --config outputs/csgo_benchmark_v2_seen10_aligned_v2_step10000/infer_step10000.yaml \
+  --seed 42 --model-path /home/jiahao/task/openvla-oft/checkpoints/openvla-7b \
+  --data-root /home/jiahao/task/UniLIP/data/csgo_benchmark_v2 \
+  --eval-root /home/jiahao/task/csgo_benchmark_v2_eval_general \
+  --eval-python /home/jiahao/task/csgo_benchmark_v2_eval_general/.venv/bin/python
+)
+```
+
+评测成功后读取独立目录的正式摘要；`coverage_complete` 应为 `true`，每图 `expected_count` 与 `prediction_count` 均为 2,000，再报告 `metrics_macro_map`。共享评测器拒绝覆盖已有非空评测结果目录，重复评测应使用新的评测输出目录。
+
+```bash
+./.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+p = Path('outputs/csgo_benchmark_v2_seen10_aligned_v2_step10000/OpenVLA-OFT/seed_42/evaluation/localization/summary_equal_map.json')
+s = json.loads(p.read_text(encoding='utf-8'))
+assert s['coverage_complete'] is True and len(s['coverage_by_map']) == 10
+assert all(v['expected_count'] == v['prediction_count'] == 2000
+           for v in s['coverage_by_map'].values())
+print(json.dumps({'coverage_complete': s['coverage_complete'],
+                  'metrics_macro_map': s['metrics_macro_map']}, indent=2, ensure_ascii=False))
+PY
+```
+
+### 4.3 legacy：复现已有接入
 
 seed 0 已有正式产物。以下使用新 seed 1 保持输出独立；若要相同 seed 重跑，应复制 YAML 并更换 `output_root`。
 
@@ -182,7 +327,7 @@ legacy 同样支持训练的 `--resume-checkpoint`，以及推理的 `--checkpoi
 
 `bash scripts/run_csgo_seen10.sh smoke --config configs/csgo_seen10.yaml --seed 0` 是历史完整 smoke 命令，**会实际串联小规模训练、推理和 evaluator**，不是只读检查。本机 seed 0 smoke 已存在；如需再次运行，先使用不同 `smoke_output_root`，不要覆盖原验收证据。本轮不执行该命令。
 
-### 4.3 官方统一评测
+### 4.4 官方统一评测
 
 正式 evaluator 要求完整 20,000 条 coverage。仅重评已有 legacy 预测时，可直接调用共享入口，写入未使用的目录：
 
